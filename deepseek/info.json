@@ -1,0 +1,13 @@
+{
+    "author": ["Riley"],
+    "name": "DeepSeek",
+    "short": "Chat with DeepSeek via !ai or by mentioning the bot.",
+    "description": "Adds a DeepSeek-backed AI assistant. Ask with the `ai` command, or just mention the bot, reply to one of its messages, or use a configured AI channel where no prefix is required. Per-channel conversation context, configurable model, system prompt, history depth and token limits. Requires a DeepSeek API key set with `[p]set api deepseek api_key <key>`.",
+    "end_user_data_statement": "Conversation context is kept in memory only and is not written to disk. Prompts and responses are sent to the DeepSeek API for processing.",
+    "min_bot_version": "3.5.0",
+    "requirements": [],
+    "tags": ["ai", "deepseek", "chat", "utility"],
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}
