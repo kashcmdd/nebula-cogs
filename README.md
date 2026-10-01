@@ -52,6 +52,14 @@ Models are `deepseek-flash` (fast, default) and `deepseek-v4-pro` (reasoning).
 The legacy `deepseek-chat` / `deepseek-reasoner` names were retired in July 2026
 and will error.
 
+### Scope
+
+By default the persona is scoped to **Discord-only** help: it declines
+off-topic requests and steers back to servers, roles, permissions, moderation
+and this bot's commands. View the current prompt with `!aiset system`, and
+replace it with your own with `!aiset system <text>` (a longer prompt is easier
+to set by editing this cog's `DEFAULT_SYSTEM` and restarting).
+
 ### Settings
 
 | Command | What it does |
