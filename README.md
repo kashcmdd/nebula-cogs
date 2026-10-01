@@ -62,20 +62,24 @@ to set by editing this cog's `DEFAULT_SYSTEM` and restarting).
 
 ### Server tools
 
-The model can call tools to use **live** server data instead of guessing:
+The model uses **tool calling** for both live data and actions.
 
-| Read tool | Returns |
-| --- | --- |
-| `server_info` | member/channel/role counts, owner, boosts, created |
-| `list_roles` | every role, highest first, with ids and flags |
-| `list_channels` | channels grouped by category |
-| `member_info` | a member's roles, top role and join date |
+**Read:** `server_info`, `list_roles`, `list_channels`, `member_info`,
+`list_bans`, `list_invites`.
 
-Action tools: `add_role` and `remove_role`. These are only offered when the
-requester can already **Manage Roles**, and are re-checked at execution time
-against the **requester** (never the bot), plus role-hierarchy rules — so a
-non-privileged user can't talk the bot into changing roles. Every action is
-logged. Disable actions entirely with `!aiset actions false`.
+**Act:** `add_role`, `remove_role`, `create_role`, `edit_role`, `delete_role`,
+`create_text_channel`, `create_voice_channel`, `create_category`,
+`delete_channel`, `rename_channel`, `set_channel_topic`, `set_slowmode`,
+`set_channel_lock`, `kick_member`, `ban_member`, `unban_member`,
+`timeout_member`, `remove_timeout`, `set_nickname`, `purge_messages`,
+`create_invite`.
+
+Every action is checked against the **requester's** Discord permission
+(Manage Channels / Roles, Kick / Ban Members, Moderate Members, Manage
+Nicknames, Manage Messages, Create Invite) at execution time — never the
+bot's — plus role-hierarchy rules, and is logged. A non-privileged user can't
+talk the bot into doing anything they couldn't do themselves. Disable all
+actions with `!aiset actions false`.
 
 ### Settings
 

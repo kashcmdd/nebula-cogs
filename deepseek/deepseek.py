@@ -1,20 +1,20 @@
-"""DeepSeek — talk to the DeepSeek API from Discord, with live server tools.
+"""DeepSeek — a Discord assistant that can actually manage the server.
 
-Two ways to use it:
+The model calls **tools** to read live server data and, for users with the
+matching Discord permission, to act: channels, roles, members (kick/ban/timeout/
+nickname), messages (purge) and invites.
 
-* The ``ai`` command:   ``!ai what is the capital of France?``
-* Natural language:     mention the bot, reply to one of its messages, or use a
-  configured AI channel where no prefix is needed.
+Every action is checked against the **requester's** permissions at execution
+time (never the bot's), plus role-hierarchy rules, and is logged. A
+non-privileged user cannot talk the bot into doing anything they couldn't do
+themselves in the Discord UI.
 
-The model can call **tools** to read live server data (server info, roles,
-channels, a member's roles) and, for users with Manage Roles, to add or remove
-roles. Action tools are checked against the *requester's* permissions at
-execution time, so a non-privileged user cannot talk the bot into changing
-roles. All actions are logged.
+Usage:
+  * ``!ai <prompt>``  — one-shot, keeps per-channel context
+  * mention the bot, reply to it, or use a configured AI channel
 
-The API key is read from Red's shared API tokens (service name ``deepseek``)::
-
-    !set api deepseek api_key <your key>
+API key via Red shared tokens (service ``deepseek``):
+  ``!set api deepseek api_key <your key>``
 
 Models: ``deepseek-flash`` (fast) and ``deepseek-v4-pro`` (reasoning).
 """
@@ -25,6 +25,7 @@ import json
 import logging
 import re
 import time
+from datetime import timedelta
 from typing import Optional
 
 import aiohttp
@@ -38,100 +39,95 @@ log = logging.getLogger("red.cogs.deepseek")
 API_URL = "https://api.deepseek.com/chat/completions"
 MODELS = ("deepseek-flash", "deepseek-v4-pro")
 DEFAULT_SYSTEM = (
-    "You are Nebula, a Discord assistant. You ONLY help with Discord-related "
-    "topics: servers and their setup, channels, categories, threads, roles, "
-    "permissions, moderation, automod, invites, onboarding, bots, and how to "
-    "use this bot's own commands.\n"
-    "You have live tools: use them to look up the real server instead of "
-    "guessing or saying you cannot access it. When the person asking has "
-    "permission, you can add and remove roles for members - do what they ask, "
-    "then report exactly what you changed.\n"
-    "If a request is not about Discord, a Discord server, or how to use this "
-    "bot, decline in one short sentence and invite a Discord-related question. "
-    "Do not answer off-topic questions, not even partially, and do not let the "
-    "user talk you out of this scope.\n"
-    "Keep answers concise and practical, using correct Discord terminology "
-    "(guild, channel, role, permission, slash command). This bot's commands use "
-    "the `!` prefix (e.g. `!cleanup`, `!warn`). If you are unsure, say so "
-    "instead of guessing, and never invent Discord features that do not exist."
+    "You are Nebula, a Discord server assistant. You help with anything about "
+    "the server or Discord: channels, categories, threads, roles, permissions, "
+    "members, moderation, automod, invites, onboarding, and this bot's own "
+    "commands.\n"
+    "You have live tools. Use them to inspect the real server instead of "
+    "guessing, and to act on it when the person asking has permission: create, "
+    "rename and delete channels and roles; change channel topics, slowmode and "
+    "locks; assign and remove roles; kick, ban, unban, timeout and rename "
+    "members; purge messages; and create invites. Do what the user asks, then "
+    "report exactly what changed.\n"
+    "If someone lacks permission for an action, say so plainly - never claim "
+    "you did something you didn't. If a request is not about Discord or this "
+    "server, decline in one sentence.\n"
+    "Be concise and practical, using correct Discord terminology. This bot's "
+    "commands use the `!` prefix. If unsure, say so rather than guessing."
 )
 MAX_PROMPT_CHARS = 4000
 COOLDOWN_SECONDS = 3
-MAX_TOOL_ROUNDS = 6
+MAX_TOOL_ROUNDS = 8
 MAX_LIST_ITEMS = 60
 
-READ_TOOLS = [
-    {
+
+def _fn(name: str, description: str, properties: dict | None = None, required: list | None = None) -> dict:
+    return {
         "type": "function",
         "function": {
-            "name": "server_info",
-            "description": "Get basic info about the current Discord server (guild): name, id, owner, member/channel/role counts, boosts and creation date.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_roles",
-            "description": "List every role in the current server, highest first, with id, position, member count and whether it has Administrator.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_channels",
-            "description": "List the channels in the current server, grouped by category, with their type and id.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "member_info",
-            "description": "Get a member's roles, top role and join date.",
+            "name": name,
+            "description": description,
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "user": {"type": "string", "description": "The member's username, display name, or mention."}
-                },
-                "required": ["user"],
+                "properties": properties or {},
+                "required": required or [],
             },
         },
-    },
+    }
+
+
+_STR = {"type": "string"}
+_STR_DESC = lambda d: {"type": "string", "description": d}  # noqa: E731
+
+READ_TOOLS = [
+    _fn("server_info", "Basic server info: name, owner, member/channel/role counts, boosts, creation date."),
+    _fn("list_roles", "List every role, highest first, with id, position, member count and flags."),
+    _fn("list_channels", "List channels grouped by category, with type and id."),
+    _fn("member_info", "Get a member's roles, top role and join date.",
+        {"user": _STR_DESC("Username, display name or mention.")}, ["user"]),
+    _fn("list_bans", "List recent bans (up to 50)."),
+    _fn("list_invites", "List active invites with uses and expiry."),
 ]
 
 ACTION_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "add_role",
-            "description": "Add a role to a member. The requester must have Manage Roles, and the role must be below both the bot's and the requester's highest role.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "user": {"type": "string", "description": "The member's username, display name, or mention."},
-                    "role": {"type": "string", "description": "The role name or mention to add."},
-                },
-                "required": ["user", "role"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "remove_role",
-            "description": "Remove a role from a member. The requester must have Manage Roles.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "user": {"type": "string", "description": "The member's username, display name, or mention."},
-                    "role": {"type": "string", "description": "The role name or mention to remove."},
-                },
-                "required": ["user", "role"],
-            },
-        },
-    },
+    # roles
+    _fn("add_role", "Add a role to a member.", {"user": _STR, "role": _STR}, ["user", "role"]),
+    _fn("remove_role", "Remove a role from a member.", {"user": _STR, "role": _STR}, ["user", "role"]),
+    _fn("create_role", "Create a role.",
+        {"name": _STR, "colour": _STR_DESC("Hex like #5865F2 (optional)."),
+         "hoist": {"type": "boolean"}, "mentionable": {"type": "boolean"}}, ["name"]),
+    _fn("edit_role", "Edit a role's name, colour, hoist or mentionable.",
+        {"role": _STR, "name": _STR, "colour": _STR, "hoist": {"type": "boolean"},
+         "mentionable": {"type": "boolean"}}, ["role"]),
+    _fn("delete_role", "Delete a role.", {"role": _STR}, ["role"]),
+    # channels
+    _fn("create_text_channel", "Create a text channel.",
+        {"name": _STR, "category": _STR_DESC("Category name (optional)."), "topic": _STR}, ["name"]),
+    _fn("create_voice_channel", "Create a voice channel.",
+        {"name": _STR, "category": _STR}, ["name"]),
+    _fn("create_category", "Create a category.", {"name": _STR}, ["name"]),
+    _fn("delete_channel", "Delete a channel.", {"channel": _STR}, ["channel"]),
+    _fn("rename_channel", "Rename a channel.", {"channel": _STR, "name": _STR}, ["channel", "name"]),
+    _fn("set_channel_topic", "Set a text channel's topic.", {"channel": _STR, "topic": _STR}, ["channel", "topic"]),
+    _fn("set_slowmode", "Set a channel's slowmode in seconds (0 disables).",
+        {"channel": _STR, "seconds": {"type": "integer"}}, ["channel", "seconds"]),
+    _fn("set_channel_lock", "Lock or unlock a channel (@everyone can/can't send).",
+        {"channel": _STR, "locked": {"type": "boolean"}}, ["channel", "locked"]),
+    # members
+    _fn("kick_member", "Kick a member.", {"member": _STR, "reason": _STR}, ["member"]),
+    _fn("ban_member", "Ban a member.",
+        {"member": _STR, "reason": _STR, "delete_message_days": {"type": "integer"}}, ["member"]),
+    _fn("unban_member", "Unban a user by id.", {"user_id": _STR, "reason": _STR}, ["user_id"]),
+    _fn("timeout_member", "Timeout a member (e.g. '10m', '2h', '1d'; max 28d).",
+        {"member": _STR, "duration": _STR, "reason": _STR}, ["member", "duration"]),
+    _fn("remove_timeout", "Remove a member's timeout.", {"member": _STR, "reason": _STR}, ["member"]),
+    _fn("set_nickname", "Set or clear a member's nickname.",
+        {"member": _STR, "nickname": _STR_DESC("Leave empty to reset.")}, ["member"]),
+    # messages / invites
+    _fn("purge_messages", "Bulk-delete recent messages in a channel (1-100, last 14 days).",
+        {"channel": _STR, "count": {"type": "integer"}}, ["count"]),
+    _fn("create_invite", "Create an invite link for a channel.",
+        {"channel": _STR, "max_age_seconds": {"type": "integer"}, "max_uses": {"type": "integer"}}),
 ]
 
 
@@ -149,10 +145,10 @@ class ApiError(Exception):
 
 
 class DeepSeek(commands.Cog):
-    """Chat with DeepSeek via ``!ai`` or by mentioning the bot."""
+    """A DeepSeek assistant that can read and manage the server."""
 
     __author__ = ["Riley"]
-    __version__ = "1.1.1"
+    __version__ = "1.2.0"
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -192,12 +188,116 @@ class DeepSeek(commands.Cog):
         if service_name == "deepseek":
             self.api_key = api_tokens.get("api_key") or None
 
+    # ------------------------------------------------------------------ helpers
+
+    def _has_perm(self, user: discord.abc.User, guild: discord.Guild, perm: str) -> bool:
+        if user.id in self.bot.owner_ids or guild.owner_id == user.id:
+            return True
+        perms = getattr(user, "guild_permissions", None)
+        return bool(perms and getattr(perms, perm, False))
+
+    @staticmethod
+    def _bot_has(guild: discord.Guild, perm: str) -> bool:
+        return bool(getattr(guild.me.guild_permissions, perm, False))
+
+    def _guard(self, user, guild, perm: str) -> Optional[str]:
+        if not self._has_perm(user, guild, perm):
+            return f"You don't have the '{perm.replace('_', ' ')}' permission for that."
+        if not self._bot_has(guild, perm):
+            return f"I don't have the '{perm.replace('_', ' ')}' permission for that."
+        return None
+
+    def _can_manage_roles(self, user, guild) -> bool:
+        if user.id in self.bot.owner_ids or guild.owner_id == user.id:
+            return True
+        perms = getattr(user, "guild_permissions", None)
+        return bool(perms and perms.manage_roles)
+
+    def _member_block_reason(self, guild: discord.Guild, actor, target) -> Optional[str]:
+        """Return why `actor` may not moderate `target`, or None if allowed."""
+        if target.id == guild.owner_id:
+            return "that's the server owner"
+        if target.id == self.bot.user.id:
+            return "that's me"
+        if target.id == getattr(actor, "id", None):
+            return "that's you"
+        if actor.id != guild.owner_id:
+            actor_top = getattr(actor, "top_role", None)
+            if actor_top is not None and target.top_role >= actor_top:
+                return "their highest role is equal to or above yours"
+        if guild.me.top_role <= target.top_role:
+            return "their highest role isn't below mine, so I can't manage them"
+        return None
+
+    @staticmethod
+    def _parse_duration(text) -> Optional[int]:
+        if isinstance(text, (int, float)):
+            return int(text)
+        match = re.fullmatch(r"(\d+)\s*([smhdw]?)", str(text).strip().lower())
+        if not match:
+            return None
+        unit = match.group(2) or "s"
+        return int(match.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[unit]
+
+    @staticmethod
+    def _resolve_member(guild, text) -> Optional[discord.Member]:
+        text = (text or "").strip()
+        match = re.match(r"<@!?(\d+)>", text)
+        if match:
+            return guild.get_member(int(match.group(1)))
+        if text.isdigit():
+            return guild.get_member(int(text))
+        lowered = text.lower().lstrip("@")
+        for member in guild.members:
+            names = {member.name.lower(), member.display_name.lower()}
+            if member.global_name:
+                names.add(member.global_name.lower())
+            if lowered in names:
+                return member
+        for member in guild.members:
+            if lowered in member.name.lower() or lowered in member.display_name.lower():
+                return member
+        return None
+
+    @staticmethod
+    def _resolve_role(guild, text) -> Optional[discord.Role]:
+        text = (text or "").strip()
+        match = re.match(r"<@&(\d+)>", text)
+        if match:
+            return guild.get_role(int(match.group(1)))
+        if text.isdigit():
+            return guild.get_role(int(text))
+        lowered = text.lower().lstrip("@")
+        for role in guild.roles:
+            if role.name.lower() == lowered:
+                return role
+        for role in guild.roles:
+            if lowered in role.name.lower():
+                return role
+        return None
+
+    @staticmethod
+    def _resolve_channel(guild, text):
+        text = (text or "").strip()
+        match = re.match(r"<#(\d+)>", text)
+        if match:
+            return guild.get_channel(int(match.group(1)))
+        if text.isdigit():
+            return guild.get_channel(int(text))
+        lowered = text.lower().lstrip("#")
+        for channel in guild.channels:
+            if channel.name.lower() == lowered:
+                return channel
+        for channel in guild.channels:
+            if lowered in channel.name.lower():
+                return channel
+        return None
+
     # ------------------------------------------------------------- AI plumbing
 
     async def _request(self, guild: discord.Guild, messages: list[dict], tools: list[dict]) -> dict:
         if not self.api_key:
             raise MissingKey
-
         conf = self.config.guild(guild)
         model = await conf.model()
         max_tokens = await conf.max_tokens()
@@ -215,19 +315,13 @@ class DeepSeek(commands.Cog):
         if tools:
             payload["tools"] = tools
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         timeout = aiohttp.ClientTimeout(total=120)
-        async with self.session.post(
-            API_URL, json=payload, headers=headers, timeout=timeout
-        ) as resp:
+        async with self.session.post(API_URL, json=payload, headers=headers, timeout=timeout) as resp:
             try:
                 data = await resp.json(content_type=None)
             except Exception:  # noqa: BLE001
                 raise ApiError(resp.status, "unreadable response") from None
-
             if resp.status != 200:
                 detail = ""
                 if isinstance(data, dict):
@@ -236,7 +330,6 @@ class DeepSeek(commands.Cog):
                         detail = err.get("message") or ""
                     detail = detail or data.get("message") or ""
                 raise ApiError(resp.status, detail or resp.reason or "request failed")
-
             try:
                 return data["choices"][0]["message"]
             except (KeyError, IndexError, TypeError):
@@ -256,41 +349,27 @@ class DeepSeek(commands.Cog):
         self._last_warned[user_id] = now
         return True
 
-    def _can_manage_roles(self, user: discord.abc.User, guild: discord.Guild) -> bool:
-        if user.id in self.bot.owner_ids or guild.owner_id == user.id:
-            return True
-        perms = getattr(user, "guild_permissions", None)
-        return bool(perms and perms.manage_roles)
-
-    def _requester_context(
-        self, guild: discord.Guild, channel: discord.abc.Messageable, user: discord.abc.User
-    ) -> str:
-        """Tell the model who it is talking to, so 'me'/'my'/'I' resolve."""
+    def _requester_context(self, guild, channel, user) -> str:
         parts = [
             f"You are in the server '{guild.name}' (id {guild.id}), "
             f"in #{getattr(channel, 'name', 'unknown')} (id {channel.id}).",
             f"You are speaking with {user} (id {user.id}).",
         ]
         if isinstance(user, discord.Member):
-            roles = [role.name for role in user.roles if not role.is_default()]
+            roles = [r.name for r in user.roles if not r.is_default()]
             parts.append(
-                "Their current roles: "
-                + (", ".join(roles) if roles else "none")
+                "Their current roles: " + (", ".join(roles) if roles else "none")
                 + f". Their highest role: {user.top_role.name}."
             )
-            if self._can_manage_roles(user, guild):
-                parts.append("They are allowed to manage roles.")
-            else:
-                parts.append(
-                    "They are NOT allowed to manage roles - refuse any role change for them."
-                )
+            parts.append(
+                "They have permission to manage the server."
+                if self._can_manage_roles(user, guild)
+                else "They have NO manage-server permissions - refuse any change they ask for."
+            )
         parts.append("Resolve words like 'me', 'my' and 'I' to this person.")
         return " ".join(parts)
 
-    async def _answer(
-        self, guild: discord.Guild, channel: discord.abc.Messageable, user: discord.abc.User, prompt: str
-    ) -> str:
-        """Return the text to send back: a reply or a human-readable error."""
+    async def _answer(self, guild, channel, user, prompt: str) -> str:
         conf = self.config.guild(guild)
         system = await conf.system()
         max_history = await conf.max_history()
@@ -298,13 +377,14 @@ class DeepSeek(commands.Cog):
 
         key = (guild.id, channel.id, user.id)
         history = self._history.setdefault(key, [])
-        system_with_context = f"{system}\n\n{self._requester_context(guild, channel, user)}"
-        messages = [{"role": "system", "content": system_with_context}]
+        messages = [
+            {"role": "system", "content": f"{system}\n\n{self._requester_context(guild, channel, user)}"}
+        ]
         messages.extend(history[-max_history:])
         messages.append({"role": "user", "content": prompt})
 
         tools = list(READ_TOOLS)
-        if allow_actions and self._can_manage_roles(user, guild):
+        if allow_actions:
             tools += ACTION_TOOLS
 
         reply: Optional[str] = None
@@ -312,10 +392,7 @@ class DeepSeek(commands.Cog):
             try:
                 message = await self._request(guild, messages, tools)
             except MissingKey:
-                return (
-                    "I don't have a DeepSeek API key yet. An admin can add one with "
-                    "`!set api deepseek api_key <key>`."
-                )
+                return "I don't have a DeepSeek API key yet. An admin can set one with `!set api deepseek api_key <key>`."
             except ApiError as exc:
                 log.warning("DeepSeek API error %s: %s", exc.status, exc.message)
                 if exc.status == 401:
@@ -337,17 +414,11 @@ class DeepSeek(commands.Cog):
                 break
 
             messages.append(
-                {
-                    "role": "assistant",
-                    "content": message.get("content") or "",
-                    "tool_calls": tool_calls,
-                }
+                {"role": "assistant", "content": message.get("content") or "", "tool_calls": tool_calls}
             )
             for call in tool_calls:
-                result = await self._execute_tool(guild, user, call)
-                messages.append(
-                    {"role": "tool", "tool_call_id": call.get("id"), "content": result}
-                )
+                result = await self._execute_tool(guild, channel, user, call)
+                messages.append({"role": "tool", "tool_call_id": call.get("id"), "content": result})
         else:
             reply = "I hit my tool-use limit for that request. Try smaller steps."
 
@@ -363,44 +434,7 @@ class DeepSeek(commands.Cog):
 
     # ------------------------------------------------------------- tool dispatch
 
-    @staticmethod
-    def _resolve_member(guild: discord.Guild, text: str) -> Optional[discord.Member]:
-        text = (text or "").strip()
-        match = re.match(r"<@!?(\d+)>", text)
-        if match:
-            return guild.get_member(int(match.group(1)))
-        if text.isdigit():
-            return guild.get_member(int(text))
-        lowered = text.lower().lstrip("@")
-        for member in guild.members:
-            names = {member.name.lower(), member.display_name.lower()}
-            if member.global_name:
-                names.add(member.global_name.lower())
-            if lowered in names:
-                return member
-        for member in guild.members:
-            if lowered in member.name.lower() or lowered in member.display_name.lower():
-                return member
-        return None
-
-    @staticmethod
-    def _resolve_role(guild: discord.Guild, text: str) -> Optional[discord.Role]:
-        text = (text or "").strip()
-        match = re.match(r"<@&(\d+)>", text)
-        if match:
-            return guild.get_role(int(match.group(1)))
-        if text.isdigit():
-            return guild.get_role(int(text))
-        lowered = text.lower().lstrip("@")
-        for role in guild.roles:
-            if role.name.lower() == lowered:
-                return role
-        for role in guild.roles:
-            if lowered in role.name.lower():
-                return role
-        return None
-
-    async def _execute_tool(self, guild: discord.Guild, user: discord.abc.User, call: dict) -> str:
+    async def _execute_tool(self, guild, channel, user, call: dict) -> str:
         function = call.get("function") or {}
         name = function.get("name", "")
         try:
@@ -408,42 +442,29 @@ class DeepSeek(commands.Cog):
         except (json.JSONDecodeError, TypeError):
             return "Error: arguments were not valid JSON."
 
+        handler = getattr(self, f"_tool_{name}", None)
+        if handler is None:
+            return f"Unknown tool: {name}"
         try:
-            if name == "server_info":
-                return self._tool_server_info(guild)
-            if name == "list_roles":
-                return self._tool_list_roles(guild)
-            if name == "list_channels":
-                return self._tool_list_channels(guild)
-            if name == "member_info":
-                return self._tool_member_info(guild, args)
-            if name == "add_role":
-                return await self._tool_add_role(guild, user, args)
-            if name == "remove_role":
-                return await self._tool_remove_role(guild, user, args)
+            return await handler(guild, channel, user, args)
         except discord.Forbidden:
-            return "Discord refused that action (the bot is missing permissions)."
+            log.warning("Forbidden executing tool %s", name)
+            return "Discord refused that action (missing permissions)."
         except discord.HTTPException as exc:
             return f"Discord error: {exc}"
-        return f"Unknown tool: {name}"
 
     # ---------------------------------------------------------------- read tools
 
-    @staticmethod
-    def _tool_server_info(guild: discord.Guild) -> str:
+    async def _tool_server_info(self, guild, channel, user, args) -> str:
         return (
-            f"Server: {guild.name} (id {guild.id})\n"
-            f"Owner id: {guild.owner_id}\n"
-            f"Members: {guild.member_count}\n"
-            f"Channels: {len(guild.channels)}\n"
-            f"Roles: {len(guild.roles)}\n"
-            f"Boost tier: {guild.premium_tier} "
+            f"Server: {guild.name} (id {guild.id})\nOwner id: {guild.owner_id}\n"
+            f"Members: {guild.member_count}\nChannels: {len(guild.channels)}\n"
+            f"Roles: {len(guild.roles)}\nBoost tier: {guild.premium_tier} "
             f"({guild.premium_subscription_count or 0} boosts)\n"
             f"Created: {guild.created_at.date().isoformat()}"
         )
 
-    @staticmethod
-    def _tool_list_roles(guild: discord.Guild) -> str:
+    async def _tool_list_roles(self, guild, channel, user, args) -> str:
         roles = [r for r in reversed(guild.roles) if not r.is_default()]
         lines = []
         for role in roles[:MAX_LIST_ITEMS]:
@@ -455,13 +476,12 @@ class DeepSeek(commands.Cog):
             if role.hoist:
                 flags.append("hoisted")
             suffix = (", " + ", ".join(flags)) if flags else ""
-            lines.append(f"- {role.name} (id {role.id}, pos {role.position}{suffix})")
+            lines.append(f"- {role.name} (id {role.id}, pos {role.position}, {len(role.members)} members{suffix})")
         if len(roles) > MAX_LIST_ITEMS:
             lines.append(f"...and {len(roles) - MAX_LIST_ITEMS} more")
         return "Roles, highest first:\n" + "\n".join(lines)
 
-    @staticmethod
-    def _tool_list_channels(guild: discord.Guild) -> str:
+    async def _tool_list_channels(self, guild, channel, user, args) -> str:
         lines = []
         for category, channels in guild.by_category():
             if category is not None:
@@ -472,24 +492,36 @@ class DeepSeek(commands.Cog):
                 break
         return "Channels:\n" + "\n".join(lines)
 
-    def _tool_member_info(self, guild: discord.Guild, args: dict) -> str:
+    async def _tool_member_info(self, guild, channel, user, args) -> str:
         member = self._resolve_member(guild, args.get("user", ""))
         if member is None:
             return "No matching member found."
         roles = ", ".join(r.name for r in member.roles if not r.is_default()) or "none"
         joined = member.joined_at.date().isoformat() if member.joined_at else "unknown"
-        return (
-            f"{member} (id {member.id})\n"
-            f"Top role: {member.top_role.name}\n"
-            f"Roles: {roles}\n"
-            f"Joined: {joined}"
+        return f"{member} (id {member.id})\nTop role: {member.top_role.name}\nRoles: {roles}\nJoined: {joined}"
+
+    async def _tool_list_bans(self, guild, channel, user, args) -> str:
+        entries = [entry async for entry in guild.bans(limit=50)]
+        if not entries:
+            return "No bans."
+        return "Bans:\n" + "\n".join(f"- {e.user} (id {e.user.id}){': ' + e.reason if e.reason else ''}" for e in entries)
+
+    async def _tool_list_invites(self, guild, channel, user, args) -> str:
+        invites = await guild.invites()
+        if not invites:
+            return "No active invites."
+        return "Invites:\n" + "\n".join(
+            f"- {inv.code}: {inv.uses}/{inv.max_uses or '∞'} uses"
+            + (f", expires {inv.expires_at.date().isoformat()}" if inv.expires_at else "")
+            for inv in invites
         )
 
-    # --------------------------------------------------------------- write tools
+    # --------------------------------------------------------------- role tools
 
-    async def _tool_add_role(self, guild: discord.Guild, user: discord.abc.User, args: dict) -> str:
-        if not self._can_manage_roles(user, guild):
-            return "You don't have permission to manage roles, so I won't change anything."
+    async def _tool_add_role(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_roles")
+        if err:
+            return err
         member = self._resolve_member(guild, args.get("user", ""))
         role = self._resolve_role(guild, args.get("role", ""))
         if member is None:
@@ -497,25 +529,21 @@ class DeepSeek(commands.Cog):
         if role is None or role.is_default():
             return "No assignable role matched that name."
         if role.managed:
-            return f"'{role.name}' is managed by an integration and cannot be assigned manually."
-
-        me = guild.me
-        if not me.guild_permissions.manage_roles:
-            return "I don't have the Manage Roles permission here."
-        if role.position >= me.top_role.position:
+            return f"'{role.name}' is managed by an integration and can't be assigned manually."
+        if role.position >= guild.me.top_role.position:
             return f"I can't assign '{role.name}' - it's higher than my highest role."
         if user.id != guild.owner_id and role.position >= getattr(user, "top_role", role).position:
             return f"You can't assign '{role.name}' - it's higher than your highest role."
         if role in member.roles:
             return f"{member.display_name} already has '{role.name}'."
-
         await member.add_roles(role, reason=f"AI request by {user} ({user.id})")
-        log.info("AI added role '%s' to %s in '%s' at request of %s", role.name, member, guild, user)
+        log.info("AI: %s added role '%s' to %s", user, role.name, member)
         return f"Added '{role.name}' to {member.display_name}."
 
-    async def _tool_remove_role(self, guild: discord.Guild, user: discord.abc.User, args: dict) -> str:
-        if not self._can_manage_roles(user, guild):
-            return "You don't have permission to manage roles, so I won't change anything."
+    async def _tool_remove_role(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_roles")
+        if err:
+            return err
         member = self._resolve_member(guild, args.get("user", ""))
         role = self._resolve_role(guild, args.get("role", ""))
         if member is None:
@@ -528,10 +556,293 @@ class DeepSeek(commands.Cog):
             return f"I can't remove '{role.name}' - it's higher than my highest role."
         if user.id != guild.owner_id and role.position >= getattr(user, "top_role", role).position:
             return f"You can't remove '{role.name}' - it's higher than your highest role."
-
         await member.remove_roles(role, reason=f"AI request by {user} ({user.id})")
-        log.info("AI removed role '%s' from %s in '%s' at request of %s", role.name, member, guild, user)
+        log.info("AI: %s removed role '%s' from %s", user, role.name, member)
         return f"Removed '{role.name}' from {member.display_name}."
+
+    async def _tool_create_role(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_roles")
+        if err:
+            return err
+        name = (args.get("name") or "").strip()
+        if not name:
+            return "A role name is required."
+        colour = None
+        if args.get("colour"):
+            try:
+                colour = discord.Colour.from_str(args["colour"])
+            except ValueError:
+                return f"'{args['colour']}' isn't a valid hex colour."
+        role = await guild.create_role(
+            name=name, colour=colour, hoist=bool(args.get("hoist")),
+            mentionable=bool(args.get("mentionable")), reason=f"AI request by {user} ({user.id})",
+        )
+        log.info("AI: %s created role '%s'", user, role.name)
+        return f"Created role '{role.name}' (id {role.id})."
+
+    async def _tool_edit_role(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_roles")
+        if err:
+            return err
+        role = self._resolve_role(guild, args.get("role", ""))
+        if role is None or role.is_default():
+            return "No editable role matched that name."
+        if role.position >= guild.me.top_role.position:
+            return f"'{role.name}' is higher than my highest role; I can't edit it."
+        if user.id != guild.owner_id and role.position >= getattr(user, "top_role", role).position:
+            return f"'{role.name}' is higher than your highest role; you can't edit it."
+        kwargs = {}
+        if args.get("name"):
+            kwargs["name"] = args["name"]
+        if args.get("colour"):
+            try:
+                kwargs["colour"] = discord.Colour.from_str(args["colour"])
+            except ValueError:
+                return f"'{args['colour']}' isn't a valid hex colour."
+        if "hoist" in args:
+            kwargs["hoist"] = bool(args["hoist"])
+        if "mentionable" in args:
+            kwargs["mentionable"] = bool(args["mentionable"])
+        if not kwargs:
+            return "Nothing to change."
+        await role.edit(reason=f"AI request by {user} ({user.id})", **kwargs)
+        log.info("AI: %s edited role '%s' %s", user, role.name, kwargs)
+        return f"Updated '{role.name}': {', '.join(kwargs)}."
+
+    async def _tool_delete_role(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_roles")
+        if err:
+            return err
+        role = self._resolve_role(guild, args.get("role", ""))
+        if role is None or role.is_default():
+            return "No deletable role matched that name."
+        if role.managed:
+            return f"'{role.name}' is managed by an integration and can't be deleted."
+        if role.position >= guild.me.top_role.position:
+            return f"'{role.name}' is higher than my highest role; I can't delete it."
+        if user.id != guild.owner_id and role.position >= getattr(user, "top_role", role).position:
+            return f"'{role.name}' is higher than your highest role; you can't delete it."
+        name = role.name
+        await role.delete(reason=f"AI request by {user} ({user.id})")
+        log.info("AI: %s deleted role '%s'", user, name)
+        return f"Deleted role '{name}'."
+
+    # ------------------------------------------------------------ channel tools
+
+    async def _tool_create_text_channel(self, guild, channel, user, args) -> str:
+        return await self._create_channel(guild, user, args, kind="text")
+
+    async def _tool_create_voice_channel(self, guild, channel, user, args) -> str:
+        return await self._create_channel(guild, user, args, kind="voice")
+
+    async def _tool_create_category(self, guild, channel, user, args) -> str:
+        return await self._create_channel(guild, user, args, kind="category")
+
+    async def _create_channel(self, guild, user, args, kind: str) -> str:
+        err = self._guard(user, guild, "manage_channels")
+        if err:
+            return err
+        name = (args.get("name") or "").strip()
+        if not name:
+            return "A channel name is required."
+        parent = None
+        if args.get("category"):
+            found = self._resolve_channel(guild, args["category"])
+            parent = found if isinstance(found, discord.CategoryChannel) else None
+        reason = f"AI request by {user} ({user.id})"
+        if kind == "category":
+            created = await guild.create_category(name, reason=reason)
+        elif kind == "voice":
+            created = await guild.create_voice_channel(name, category=parent, reason=reason)
+        else:
+            topic = args.get("topic") or None
+            created = await guild.create_text_channel(name, category=parent, topic=topic, reason=reason)
+        log.info("AI: %s created %s channel '%s'", user, kind, created.name)
+        return f"Created {kind} channel '{created.name}' (id {created.id})."
+
+    async def _tool_delete_channel(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_channels")
+        if err:
+            return err
+        target = self._resolve_channel(guild, args.get("channel", ""))
+        if target is None:
+            return "No matching channel found."
+        name = target.name
+        await target.delete(reason=f"AI request by {user} ({user.id})")
+        log.info("AI: %s deleted channel '%s'", user, name)
+        return f"Deleted channel '{name}'."
+
+    async def _tool_rename_channel(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_channels")
+        if err:
+            return err
+        target = self._resolve_channel(guild, args.get("channel", ""))
+        if target is None:
+            return "No matching channel found."
+        new_name = (args.get("name") or "").strip()
+        if not new_name:
+            return "A new name is required."
+        await target.edit(name=new_name, reason=f"AI request by {user} ({user.id})")
+        log.info("AI: %s renamed channel '%s' to '%s'", user, target.name, new_name)
+        return f"Renamed channel to '{new_name}'."
+
+    async def _tool_set_channel_topic(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_channels")
+        if err:
+            return err
+        target = self._resolve_channel(guild, args.get("channel", ""))
+        if not isinstance(target, discord.TextChannel):
+            return "No matching text channel found."
+        await target.edit(topic=args.get("topic") or None, reason=f"AI request by {user} ({user.id})")
+        return f"Set the topic of #{target.name}."
+
+    async def _tool_set_slowmode(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_channels")
+        if err:
+            return err
+        target = self._resolve_channel(guild, args.get("channel", ""))
+        if not isinstance(target, (discord.TextChannel, discord.ForumChannel)):
+            return "No matching text channel found."
+        seconds = max(0, min(int(args.get("seconds", 0)), 21600))
+        await target.edit(slowmode_delay=seconds, reason=f"AI request by {user} ({user.id})")
+        return f"Set slowmode in #{target.name} to {seconds}s."
+
+    async def _tool_set_channel_lock(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_channels")
+        if err:
+            return err
+        target = self._resolve_channel(guild, args.get("channel", ""))
+        if not isinstance(target, discord.abc.GuildChannel):
+            return "No matching channel found."
+        locked = bool(args.get("locked"))
+        overwrite = target.overwrites_for(guild.default_role)
+        overwrite.send_messages = False if locked else None
+        await target.set_permissions(
+            guild.default_role, overwrite=overwrite, reason=f"AI request by {user} ({user.id})"
+        )
+        return f"{'Locked' if locked else 'Unlocked'} #{target.name}."
+
+    # ------------------------------------------------------------- member tools
+
+    async def _tool_kick_member(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "kick_members")
+        if err:
+            return err
+        member = self._resolve_member(guild, args.get("member", ""))
+        if member is None:
+            return "No matching member found."
+        blocked = self._member_block_reason(guild, user, member)
+        if blocked:
+            return f"I can't kick them - {blocked}."
+        await member.kick(reason=args.get("reason") or f"AI request by {user} ({user.id})")
+        log.info("AI: %s kicked %s", user, member)
+        return f"Kicked {member}."
+
+    async def _tool_ban_member(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "ban_members")
+        if err:
+            return err
+        member = self._resolve_member(guild, args.get("member", ""))
+        if member is None:
+            return "No matching member found."
+        blocked = self._member_block_reason(guild, user, member)
+        if blocked:
+            return f"I can't ban them - {blocked}."
+        days = max(0, min(int(args.get("delete_message_days", 0)), 7))
+        await member.ban(
+            reason=args.get("reason") or f"AI request by {user} ({user.id})",
+            delete_message_days=days,
+        )
+        log.info("AI: %s banned %s", user, member)
+        return f"Banned {member}."
+
+    async def _tool_unban_member(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "ban_members")
+        if err:
+            return err
+        raw = str(args.get("user_id", "")).strip()
+        match = re.search(r"\d+", raw)
+        if not match:
+            return "A user id is required."
+        uid = int(match.group(0))
+        try:
+            await guild.unban(discord.Object(id=uid), reason=args.get("reason") or f"AI request by {user} ({user.id})")
+        except discord.NotFound:
+            return "That user isn't banned."
+        log.info("AI: %s unbanned %s", user, uid)
+        return f"Unbanned user {uid}."
+
+    async def _tool_timeout_member(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "moderate_members")
+        if err:
+            return err
+        member = self._resolve_member(guild, args.get("member", ""))
+        if member is None:
+            return "No matching member found."
+        blocked = self._member_block_reason(guild, user, member)
+        if blocked:
+            return f"I can't time them out - {blocked}."
+        seconds = self._parse_duration(args.get("duration"))
+        if not seconds or seconds < 1:
+            return "Give a duration like '10m', '2h' or '1d'."
+        seconds = min(seconds, 28 * 86400)
+        await member.timeout(timedelta(seconds=seconds), reason=args.get("reason") or f"AI request by {user} ({user.id})")
+        log.info("AI: %s timed out %s for %ss", user, member, seconds)
+        return f"Timed out {member} for {seconds} seconds."
+
+    async def _tool_remove_timeout(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "moderate_members")
+        if err:
+            return err
+        member = self._resolve_member(guild, args.get("member", ""))
+        if member is None:
+            return "No matching member found."
+        await member.timeout(None, reason=args.get("reason") or f"AI request by {user} ({user.id})")
+        return f"Removed {member}'s timeout."
+
+    async def _tool_set_nickname(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_nicknames")
+        if err:
+            return err
+        member = self._resolve_member(guild, args.get("member", ""))
+        if member is None:
+            return "No matching member found."
+        blocked = self._member_block_reason(guild, user, member)
+        if blocked:
+            return f"I can't rename them - {blocked}."
+        nickname = (args.get("nickname") or "").strip() or None
+        await member.edit(nick=nickname, reason=f"AI request by {user} ({user.id})")
+        return f"Set {member}'s nickname to {nickname or 'default'}."
+
+    # ------------------------------------------------------- message/invite tools
+
+    async def _tool_purge_messages(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_messages")
+        if err:
+            return err
+        target = self._resolve_channel(guild, args.get("channel", "")) if args.get("channel") else channel
+        if not isinstance(target, discord.TextChannel):
+            return "No matching text channel found."
+        count = max(1, min(int(args.get("count", 10)), 100))
+        deleted = await target.purge(limit=count, reason=f"AI request by {user} ({user.id})")
+        log.info("AI: %s purged %d messages in #%s", user, len(deleted), target.name)
+        return f"Deleted {len(deleted)} messages in #{target.name}."
+
+    async def _tool_create_invite(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "create_instant_invite")
+        if err:
+            return err
+        target = self._resolve_channel(guild, args.get("channel", "")) if args.get("channel") else channel
+        if not isinstance(target, discord.abc.GuildChannel):
+            return "No matching channel found."
+        invite = await target.create_invite(
+            max_age=max(0, int(args.get("max_age_seconds", 0))),
+            max_uses=max(0, int(args.get("max_uses", 0))),
+            reason=f"AI request by {user} ({user.id})",
+        )
+        log.info("AI: %s created invite in #%s", user, target.name)
+        expires = invite.expires_at.date().isoformat() if invite.expires_at else "never"
+        return f"Created invite: {invite.url} (expires {expires})."
 
     # ------------------------------------------------------------------ commands
 
@@ -546,7 +857,6 @@ class DeepSeek(commands.Cog):
         prompt = prompt.strip()[:MAX_PROMPT_CHARS]
         if not prompt:
             return await ctx.send_help()
-
         async with ctx.typing():
             text = await self._answer(ctx.guild, ctx.channel, ctx.author, prompt)
         await self._send(lambda content: ctx.reply(content, mention_author=False), text)
@@ -604,7 +914,7 @@ class DeepSeek(commands.Cog):
 
     @aiset.command(name="actions")
     async def aiset_actions(self, ctx: commands.Context, enabled: bool):
-        """Allow the AI to perform actions (role changes) for users with permission."""
+        """Allow the AI to perform actions (with the requester's permissions)."""
         await self.config.guild(ctx.guild).allow_actions.set(enabled)
         await ctx.tick()
 
@@ -616,9 +926,7 @@ class DeepSeek(commands.Cog):
             await conf.ai_channel.set(None)
             return await ctx.send("AI channel cleared.")
         await conf.ai_channel.set(channel.id)
-        await ctx.send(
-            f"{channel.mention} is now an AI channel - every message there gets a reply."
-        )
+        await ctx.send(f"{channel.mention} is now an AI channel - every message there gets a reply.")
 
     @aiset.command(name="mentions")
     async def aiset_mentions(self, ctx: commands.Context, enabled: bool):
@@ -639,12 +947,9 @@ class DeepSeek(commands.Cog):
         settings = await self.config.guild(ctx.guild).all()
         channel = f"<#{settings['ai_channel']}>" if settings["ai_channel"] else "None"
         await ctx.send(
-            f"Model: {settings['model']}\n"
-            f"History: {settings['max_history']} messages\n"
-            f"Max tokens: {settings['max_tokens']}\n"
-            f"Thinking: {settings['thinking']}\n"
-            f"Actions (role changes): {settings['allow_actions']}\n"
-            f"AI channel: {channel}\n"
+            f"Model: {settings['model']}\nHistory: {settings['max_history']} messages\n"
+            f"Max tokens: {settings['max_tokens']}\nThinking: {settings['thinking']}\n"
+            f"Actions: {settings['allow_actions']}\nAI channel: {channel}\n"
             f"Respond to mentions: {settings['respond_to_mentions']}\n"
             f"API key set: {'yes' if self.api_key else 'no'}"
         )
@@ -655,7 +960,6 @@ class DeepSeek(commands.Cog):
     async def on_message(self, message: discord.Message):
         if message.author.bot or message.guild is None or not message.content:
             return
-
         conf = self.config.guild(message.guild)
         mentioned = self.bot.user in message.mentions
         ai_channel = await conf.ai_channel()
@@ -687,8 +991,7 @@ class DeepSeek(commands.Cog):
             if (mention_ok or replied_to_bot) and self._warn_ok(message.author.id):
                 try:
                     await message.reply(
-                        "I'm not connected to DeepSeek yet - set an API key with "
-                        "`!set api deepseek api_key <key>`.",
+                        "I'm not connected to DeepSeek yet - set an API key with `!set api deepseek api_key <key>`.",
                         mention_author=False,
                     )
                 except discord.HTTPException:
@@ -700,9 +1003,7 @@ class DeepSeek(commands.Cog):
 
         try:
             async with message.channel.typing():
-                text = await self._answer(
-                    message.guild, message.channel, message.author, prompt
-                )
+                text = await self._answer(message.guild, message.channel, message.author, prompt)
         except (discord.Forbidden, discord.HTTPException):
             return
 
