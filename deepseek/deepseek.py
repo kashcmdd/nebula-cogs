@@ -73,6 +73,7 @@ class DeepSeek(commands.Cog):
         # (guild_id, channel_id, user_id) -> list[{"role", "content"}]
         self._history: dict[tuple[int, int, int], list[dict[str, str]]] = {}
         self._last_used: dict[int, float] = {}
+        self._last_warned: dict[int, float] = {}
 
     # ---------------------------------------------------------------- lifecycle
 
@@ -147,6 +148,14 @@ class DeepSeek(commands.Cog):
         if now - self._last_used.get(user_id, 0.0) < COOLDOWN_SECONDS:
             return False
         self._last_used[user_id] = now
+        return True
+
+    def _warn_ok(self, user_id: int) -> bool:
+        """Rate-limit the 'no API key' notice so it can't be spammed."""
+        now = time.monotonic()
+        if now - self._last_warned.get(user_id, 0.0) < 60:
+            return False
+        self._last_warned[user_id] = now
         return True
 
     async def _answer(self, guild: discord.Guild, channel_id: int, user_id: int, prompt: str) -> str:
@@ -308,8 +317,6 @@ class DeepSeek(commands.Cog):
     async def on_message(self, message: discord.Message):
         if message.author.bot or message.guild is None or not message.content:
             return
-        if self.api_key is None:
-            return
 
         conf = self.config.guild(message.guild)
         mentioned = self.bot.user in message.mentions
@@ -336,7 +343,24 @@ class DeepSeek(commands.Cog):
         for token in (f"<@{self.bot.user.id}>", f"<@!{self.bot.user.id}>"):
             prompt = prompt.replace(token, "")
         prompt = prompt.strip()[:MAX_PROMPT_CHARS]
-        if not prompt or not self._cooldown_ok(message.author.id):
+        if not prompt:
+            return
+
+        if self.api_key is None:
+            # Answer when directly addressed so it's never silently ignored,
+            # but rate-limit so a keyless bot can't spam a channel.
+            if (mention_ok or replied_to_bot) and self._warn_ok(message.author.id):
+                try:
+                    await message.reply(
+                        "I'm not connected to DeepSeek yet - set an API key with "
+                        "`!set api deepseek api_key <key>`.",
+                        mention_author=False,
+                    )
+                except discord.HTTPException:
+                    pass
+            return
+
+        if not self._cooldown_ok(message.author.id):
             return
 
         try:
