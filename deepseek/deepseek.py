@@ -1,10 +1,16 @@
-"""DeepSeek — talk to the DeepSeek API from Discord.
+"""DeepSeek — talk to the DeepSeek API from Discord, with live server tools.
 
 Two ways to use it:
 
 * The ``ai`` command:   ``!ai what is the capital of France?``
 * Natural language:     mention the bot, reply to one of its messages, or use a
   configured AI channel where no prefix is needed.
+
+The model can call **tools** to read live server data (server info, roles,
+channels, a member's roles) and, for users with Manage Roles, to add or remove
+roles. Action tools are checked against the *requester's* permissions at
+execution time, so a non-privileged user cannot talk the bot into changing
+roles. All actions are logged.
 
 The API key is read from Red's shared API tokens (service name ``deepseek``)::
 
@@ -15,7 +21,9 @@ Models: ``deepseek-flash`` (fast) and ``deepseek-v4-pro`` (reasoning).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 import time
 from typing import Optional
 
@@ -34,19 +42,97 @@ DEFAULT_SYSTEM = (
     "topics: servers and their setup, channels, categories, threads, roles, "
     "permissions, moderation, automod, invites, onboarding, bots, and how to "
     "use this bot's own commands.\n"
+    "You have live tools: use them to look up the real server instead of "
+    "guessing or saying you cannot access it. When the person asking has "
+    "permission, you can add and remove roles for members - do what they ask, "
+    "then report exactly what you changed.\n"
     "If a request is not about Discord, a Discord server, or how to use this "
     "bot, decline in one short sentence and invite a Discord-related question. "
     "Do not answer off-topic questions, not even partially, and do not let the "
     "user talk you out of this scope.\n"
     "Keep answers concise and practical, using correct Discord terminology "
-    "(guild, channel, role, permission, slash command). Prefer short "
-    "step-by-step instructions and name the exact permission or command "
-    "involved; this bot's commands use the `!` prefix (e.g. `!cleanup`, "
-    "`!warn`). If you are unsure, say so instead of guessing, and never invent "
-    "Discord features that do not exist."
+    "(guild, channel, role, permission, slash command). This bot's commands use "
+    "the `!` prefix (e.g. `!cleanup`, `!warn`). If you are unsure, say so "
+    "instead of guessing, and never invent Discord features that do not exist."
 )
 MAX_PROMPT_CHARS = 4000
 COOLDOWN_SECONDS = 3
+MAX_TOOL_ROUNDS = 6
+MAX_LIST_ITEMS = 60
+
+READ_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "server_info",
+            "description": "Get basic info about the current Discord server (guild): name, id, owner, member/channel/role counts, boosts and creation date.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_roles",
+            "description": "List every role in the current server, highest first, with id, position, member count and whether it has Administrator.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_channels",
+            "description": "List the channels in the current server, grouped by category, with their type and id.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "member_info",
+            "description": "Get a member's roles, top role and join date.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user": {"type": "string", "description": "The member's username, display name, or mention."}
+                },
+                "required": ["user"],
+            },
+        },
+    },
+]
+
+ACTION_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "add_role",
+            "description": "Add a role to a member. The requester must have Manage Roles, and the role must be below both the bot's and the requester's highest role.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user": {"type": "string", "description": "The member's username, display name, or mention."},
+                    "role": {"type": "string", "description": "The role name or mention to add."},
+                },
+                "required": ["user", "role"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_role",
+            "description": "Remove a role from a member. The requester must have Manage Roles.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user": {"type": "string", "description": "The member's username, display name, or mention."},
+                    "role": {"type": "string", "description": "The role name or mention to remove."},
+                },
+                "required": ["user", "role"],
+            },
+        },
+    },
+]
 
 
 class MissingKey(Exception):
@@ -66,7 +152,7 @@ class DeepSeek(commands.Cog):
     """Chat with DeepSeek via ``!ai`` or by mentioning the bot."""
 
     __author__ = ["Riley"]
-    __version__ = "1.0.0"
+    __version__ = "1.1.0"
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -79,10 +165,10 @@ class DeepSeek(commands.Cog):
             thinking=False,
             ai_channel=None,
             respond_to_mentions=True,
+            allow_actions=True,
         )
         self.session: Optional[aiohttp.ClientSession] = None
         self.api_key: Optional[str] = None
-        # (guild_id, channel_id, user_id) -> list[{"role", "content"}]
         self._history: dict[tuple[int, int, int], list[dict[str, str]]] = {}
         self._last_used: dict[int, float] = {}
         self._last_warned: dict[int, float] = {}
@@ -108,7 +194,7 @@ class DeepSeek(commands.Cog):
 
     # ------------------------------------------------------------- AI plumbing
 
-    async def _call(self, guild: discord.Guild, messages: list[dict[str, str]]) -> str:
+    async def _request(self, guild: discord.Guild, messages: list[dict], tools: list[dict]) -> dict:
         if not self.api_key:
             raise MissingKey
 
@@ -125,8 +211,9 @@ class DeepSeek(commands.Cog):
             "thinking": {"type": "enabled" if thinking else "disabled"},
         }
         if not thinking:
-            # temperature is ignored in thinking mode, so only send it otherwise.
             payload["temperature"] = 0.7
+        if tools:
+            payload["tools"] = tools
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -138,7 +225,7 @@ class DeepSeek(commands.Cog):
         ) as resp:
             try:
                 data = await resp.json(content_type=None)
-            except Exception:  # noqa: BLE001 - any decode failure is a bad response
+            except Exception:  # noqa: BLE001
                 raise ApiError(resp.status, "unreadable response") from None
 
             if resp.status != 200:
@@ -151,7 +238,7 @@ class DeepSeek(commands.Cog):
                 raise ApiError(resp.status, detail or resp.reason or "request failed")
 
             try:
-                return str(data["choices"][0]["message"]["content"]).strip()
+                return data["choices"][0]["message"]
             except (KeyError, IndexError, TypeError):
                 raise ApiError(resp.status, "unexpected response shape") from None
 
@@ -163,46 +250,80 @@ class DeepSeek(commands.Cog):
         return True
 
     def _warn_ok(self, user_id: int) -> bool:
-        """Rate-limit the 'no API key' notice so it can't be spammed."""
         now = time.monotonic()
         if now - self._last_warned.get(user_id, 0.0) < 60:
             return False
         self._last_warned[user_id] = now
         return True
 
-    async def _answer(self, guild: discord.Guild, channel_id: int, user_id: int, prompt: str) -> str:
+    def _can_manage_roles(self, user: discord.abc.User, guild: discord.Guild) -> bool:
+        if user.id in self.bot.owner_ids or guild.owner_id == user.id:
+            return True
+        perms = getattr(user, "guild_permissions", None)
+        return bool(perms and perms.manage_roles)
+
+    async def _answer(
+        self, guild: discord.Guild, channel: discord.abc.Messageable, user: discord.abc.User, prompt: str
+    ) -> str:
         """Return the text to send back: a reply or a human-readable error."""
         conf = self.config.guild(guild)
         system = await conf.system()
         max_history = await conf.max_history()
+        allow_actions = await conf.allow_actions()
 
-        key = (guild.id, channel_id, user_id)
+        key = (guild.id, channel.id, user.id)
         history = self._history.setdefault(key, [])
         messages = [{"role": "system", "content": system}]
         messages.extend(history[-max_history:])
         messages.append({"role": "user", "content": prompt})
 
-        try:
-            reply = await self._call(guild, messages)
-        except MissingKey:
-            return (
-                "I don't have a DeepSeek API key yet. An admin can add one with "
-                "`!set api deepseek api_key <key>`."
+        tools = list(READ_TOOLS)
+        if allow_actions and self._can_manage_roles(user, guild):
+            tools += ACTION_TOOLS
+
+        reply: Optional[str] = None
+        for _ in range(MAX_TOOL_ROUNDS):
+            try:
+                message = await self._request(guild, messages, tools)
+            except MissingKey:
+                return (
+                    "I don't have a DeepSeek API key yet. An admin can add one with "
+                    "`!set api deepseek api_key <key>`."
+                )
+            except ApiError as exc:
+                log.warning("DeepSeek API error %s: %s", exc.status, exc.message)
+                if exc.status == 401:
+                    return "My DeepSeek key was rejected (401). An admin should check it."
+                if exc.status == 402:
+                    return "DeepSeek reports insufficient balance (402)."
+                if exc.status == 429:
+                    return "DeepSeek is rate-limiting me (429). Try again shortly."
+                if exc.status == 400:
+                    return "DeepSeek rejected the request (400). Check the model name."
+                return f"DeepSeek returned an error ({exc.status})."
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                log.warning("DeepSeek request failed", exc_info=True)
+                return "I couldn't reach DeepSeek just now. Try again in a moment."
+
+            tool_calls = message.get("tool_calls")
+            if not tool_calls:
+                reply = (message.get("content") or "").strip() or "I couldn't produce a reply."
+                break
+
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": message.get("content") or "",
+                    "tool_calls": tool_calls,
+                }
             )
-        except ApiError as exc:
-            log.warning("DeepSeek API error %s: %s", exc.status, exc.message)
-            if exc.status == 401:
-                return "My DeepSeek key was rejected (401). An admin should check it."
-            if exc.status == 402:
-                return "DeepSeek reports insufficient balance (402)."
-            if exc.status == 429:
-                return "DeepSeek is rate-limiting me (429). Try again shortly."
-            if exc.status == 400:
-                return "DeepSeek rejected the request (400). Check the model name."
-            return f"DeepSeek returned an error ({exc.status})."
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            log.warning("DeepSeek request failed", exc_info=True)
-            return "I couldn't reach DeepSeek just now. Try again in a moment."
+            for call in tool_calls:
+                result = await self._execute_tool(guild, user, call)
+                messages.append(
+                    {"role": "tool", "tool_call_id": call.get("id"), "content": result}
+                )
+        else:
+            reply = "I hit my tool-use limit for that request. Try smaller steps."
 
         history.append({"role": "user", "content": prompt})
         history.append({"role": "assistant", "content": reply})
@@ -213,6 +334,178 @@ class DeepSeek(commands.Cog):
     async def _send(self, send, text: str) -> None:
         for page in pagify(text, page_length=1900):
             await send(page)
+
+    # ------------------------------------------------------------- tool dispatch
+
+    @staticmethod
+    def _resolve_member(guild: discord.Guild, text: str) -> Optional[discord.Member]:
+        text = (text or "").strip()
+        match = re.match(r"<@!?(\d+)>", text)
+        if match:
+            return guild.get_member(int(match.group(1)))
+        if text.isdigit():
+            return guild.get_member(int(text))
+        lowered = text.lower().lstrip("@")
+        for member in guild.members:
+            names = {member.name.lower(), member.display_name.lower()}
+            if member.global_name:
+                names.add(member.global_name.lower())
+            if lowered in names:
+                return member
+        for member in guild.members:
+            if lowered in member.name.lower() or lowered in member.display_name.lower():
+                return member
+        return None
+
+    @staticmethod
+    def _resolve_role(guild: discord.Guild, text: str) -> Optional[discord.Role]:
+        text = (text or "").strip()
+        match = re.match(r"<@&(\d+)>", text)
+        if match:
+            return guild.get_role(int(match.group(1)))
+        if text.isdigit():
+            return guild.get_role(int(text))
+        lowered = text.lower().lstrip("@")
+        for role in guild.roles:
+            if role.name.lower() == lowered:
+                return role
+        for role in guild.roles:
+            if lowered in role.name.lower():
+                return role
+        return None
+
+    async def _execute_tool(self, guild: discord.Guild, user: discord.abc.User, call: dict) -> str:
+        function = call.get("function") or {}
+        name = function.get("name", "")
+        try:
+            args = json.loads(function.get("arguments") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return "Error: arguments were not valid JSON."
+
+        try:
+            if name == "server_info":
+                return self._tool_server_info(guild)
+            if name == "list_roles":
+                return self._tool_list_roles(guild)
+            if name == "list_channels":
+                return self._tool_list_channels(guild)
+            if name == "member_info":
+                return self._tool_member_info(guild, args)
+            if name == "add_role":
+                return await self._tool_add_role(guild, user, args)
+            if name == "remove_role":
+                return await self._tool_remove_role(guild, user, args)
+        except discord.Forbidden:
+            return "Discord refused that action (the bot is missing permissions)."
+        except discord.HTTPException as exc:
+            return f"Discord error: {exc}"
+        return f"Unknown tool: {name}"
+
+    # ---------------------------------------------------------------- read tools
+
+    @staticmethod
+    def _tool_server_info(guild: discord.Guild) -> str:
+        return (
+            f"Server: {guild.name} (id {guild.id})\n"
+            f"Owner id: {guild.owner_id}\n"
+            f"Members: {guild.member_count}\n"
+            f"Channels: {len(guild.channels)}\n"
+            f"Roles: {len(guild.roles)}\n"
+            f"Boost tier: {guild.premium_tier} "
+            f"({guild.premium_subscription_count or 0} boosts)\n"
+            f"Created: {guild.created_at.date().isoformat()}"
+        )
+
+    @staticmethod
+    def _tool_list_roles(guild: discord.Guild) -> str:
+        roles = [r for r in reversed(guild.roles) if not r.is_default()]
+        lines = []
+        for role in roles[:MAX_LIST_ITEMS]:
+            flags = []
+            if role.permissions.administrator:
+                flags.append("ADMINISTRATOR")
+            if role.managed:
+                flags.append("managed")
+            if role.hoist:
+                flags.append("hoisted")
+            suffix = (", " + ", ".join(flags)) if flags else ""
+            lines.append(f"- {role.name} (id {role.id}, pos {role.position}{suffix})")
+        if len(roles) > MAX_LIST_ITEMS:
+            lines.append(f"...and {len(roles) - MAX_LIST_ITEMS} more")
+        return "Roles, highest first:\n" + "\n".join(lines)
+
+    @staticmethod
+    def _tool_list_channels(guild: discord.Guild) -> str:
+        lines = []
+        for category, channels in guild.by_category():
+            if category is not None:
+                lines.append(f"[{category.name}]")
+            for ch in channels:
+                lines.append(f"- #{ch.name} ({ch.type.name}, id {ch.id})")
+            if len(lines) > MAX_LIST_ITEMS:
+                break
+        return "Channels:\n" + "\n".join(lines)
+
+    def _tool_member_info(self, guild: discord.Guild, args: dict) -> str:
+        member = self._resolve_member(guild, args.get("user", ""))
+        if member is None:
+            return "No matching member found."
+        roles = ", ".join(r.name for r in member.roles if not r.is_default()) or "none"
+        joined = member.joined_at.date().isoformat() if member.joined_at else "unknown"
+        return (
+            f"{member} (id {member.id})\n"
+            f"Top role: {member.top_role.name}\n"
+            f"Roles: {roles}\n"
+            f"Joined: {joined}"
+        )
+
+    # --------------------------------------------------------------- write tools
+
+    async def _tool_add_role(self, guild: discord.Guild, user: discord.abc.User, args: dict) -> str:
+        if not self._can_manage_roles(user, guild):
+            return "You don't have permission to manage roles, so I won't change anything."
+        member = self._resolve_member(guild, args.get("user", ""))
+        role = self._resolve_role(guild, args.get("role", ""))
+        if member is None:
+            return "No matching member found."
+        if role is None or role.is_default():
+            return "No assignable role matched that name."
+        if role.managed:
+            return f"'{role.name}' is managed by an integration and cannot be assigned manually."
+
+        me = guild.me
+        if not me.guild_permissions.manage_roles:
+            return "I don't have the Manage Roles permission here."
+        if role.position >= me.top_role.position:
+            return f"I can't assign '{role.name}' - it's higher than my highest role."
+        if user.id != guild.owner_id and role.position >= getattr(user, "top_role", role).position:
+            return f"You can't assign '{role.name}' - it's higher than your highest role."
+        if role in member.roles:
+            return f"{member.display_name} already has '{role.name}'."
+
+        await member.add_roles(role, reason=f"AI request by {user} ({user.id})")
+        log.info("AI added role '%s' to %s in '%s' at request of %s", role.name, member, guild, user)
+        return f"Added '{role.name}' to {member.display_name}."
+
+    async def _tool_remove_role(self, guild: discord.Guild, user: discord.abc.User, args: dict) -> str:
+        if not self._can_manage_roles(user, guild):
+            return "You don't have permission to manage roles, so I won't change anything."
+        member = self._resolve_member(guild, args.get("user", ""))
+        role = self._resolve_role(guild, args.get("role", ""))
+        if member is None:
+            return "No matching member found."
+        if role is None or role.is_default():
+            return "No removable role matched that name."
+        if role not in member.roles:
+            return f"{member.display_name} doesn't have '{role.name}'."
+        if role.position >= guild.me.top_role.position:
+            return f"I can't remove '{role.name}' - it's higher than my highest role."
+        if user.id != guild.owner_id and role.position >= getattr(user, "top_role", role).position:
+            return f"You can't remove '{role.name}' - it's higher than your highest role."
+
+        await member.remove_roles(role, reason=f"AI request by {user} ({user.id})")
+        log.info("AI removed role '%s' from %s in '%s' at request of %s", role.name, member, guild, user)
+        return f"Removed '{role.name}' from {member.display_name}."
 
     # ------------------------------------------------------------------ commands
 
@@ -229,7 +522,7 @@ class DeepSeek(commands.Cog):
             return await ctx.send_help()
 
         async with ctx.typing():
-            text = await self._answer(ctx.guild, ctx.channel.id, ctx.author.id, prompt)
+            text = await self._answer(ctx.guild, ctx.channel, ctx.author, prompt)
         await self._send(lambda content: ctx.reply(content, mention_author=False), text)
 
     @commands.command(name="aiclear")
@@ -283,6 +576,12 @@ class DeepSeek(commands.Cog):
         await self.config.guild(ctx.guild).thinking.set(enabled)
         await ctx.tick()
 
+    @aiset.command(name="actions")
+    async def aiset_actions(self, ctx: commands.Context, enabled: bool):
+        """Allow the AI to perform actions (role changes) for users with permission."""
+        await self.config.guild(ctx.guild).allow_actions.set(enabled)
+        await ctx.tick()
+
     @aiset.command(name="channel")
     async def aiset_channel(self, ctx: commands.Context, channel: discord.TextChannel = None):
         """Set an AI channel (no prefix needed), or omit the channel to clear it."""
@@ -318,6 +617,7 @@ class DeepSeek(commands.Cog):
             f"History: {settings['max_history']} messages\n"
             f"Max tokens: {settings['max_tokens']}\n"
             f"Thinking: {settings['thinking']}\n"
+            f"Actions (role changes): {settings['allow_actions']}\n"
             f"AI channel: {channel}\n"
             f"Respond to mentions: {settings['respond_to_mentions']}\n"
             f"API key set: {'yes' if self.api_key else 'no'}"
@@ -346,7 +646,6 @@ class DeepSeek(commands.Cog):
         if not (in_ai_channel or mention_ok or replied_to_bot):
             return
 
-        # Never hijack a command.
         prefixes = await self.bot.get_valid_prefixes(message.guild)
         if any(message.content.startswith(prefix) for prefix in prefixes):
             return
@@ -359,8 +658,6 @@ class DeepSeek(commands.Cog):
             return
 
         if self.api_key is None:
-            # Answer when directly addressed so it's never silently ignored,
-            # but rate-limit so a keyless bot can't spam a channel.
             if (mention_ok or replied_to_bot) and self._warn_ok(message.author.id):
                 try:
                     await message.reply(
@@ -378,7 +675,7 @@ class DeepSeek(commands.Cog):
         try:
             async with message.channel.typing():
                 text = await self._answer(
-                    message.guild, message.channel.id, message.author.id, prompt
+                    message.guild, message.channel, message.author, prompt
                 )
         except (discord.Forbidden, discord.HTTPException):
             return

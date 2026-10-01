@@ -60,6 +60,23 @@ and this bot's commands. View the current prompt with `!aiset system`, and
 replace it with your own with `!aiset system <text>` (a longer prompt is easier
 to set by editing this cog's `DEFAULT_SYSTEM` and restarting).
 
+### Server tools
+
+The model can call tools to use **live** server data instead of guessing:
+
+| Read tool | Returns |
+| --- | --- |
+| `server_info` | member/channel/role counts, owner, boosts, created |
+| `list_roles` | every role, highest first, with ids and flags |
+| `list_channels` | channels grouped by category |
+| `member_info` | a member's roles, top role and join date |
+
+Action tools: `add_role` and `remove_role`. These are only offered when the
+requester can already **Manage Roles**, and are re-checked at execution time
+against the **requester** (never the bot), plus role-hierarchy rules — so a
+non-privileged user can't talk the bot into changing roles. Every action is
+logged. Disable actions entirely with `!aiset actions false`.
+
 ### Settings
 
 | Command | What it does |
@@ -69,6 +86,7 @@ to set by editing this cog's `DEFAULT_SYSTEM` and restarting).
 | `!aiset history <n>` | Messages of context kept (0-100, default 10) |
 | `!aiset maxtokens <n>` | Max tokens per reply (64-8192, default 800) |
 | `!aiset thinking <bool>` | Enable DeepSeek thinking mode (slower, smarter) |
+| `!aiset actions <bool>` | Allow role changes by the AI for users with permission |
 | `!aiset channel <#chan>` | Set an AI channel (omit to clear) |
 | `!aiset mentions <bool>` | Reply when mentioned (default on) |
 | `!aiset clear` | Clear all context for the server |
