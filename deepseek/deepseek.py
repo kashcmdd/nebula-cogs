@@ -41,14 +41,18 @@ MODELS = ("deepseek-flash", "deepseek-v4-pro")
 DEFAULT_SYSTEM = (
     "You are Nebula, a Discord server assistant. You help with anything about "
     "the server or Discord: channels, categories, threads, roles, permissions, "
-    "members, moderation, automod, invites, onboarding, and this bot's own "
-    "commands.\n"
+    "webhooks, emojis, members, moderation, automod, invites, server settings, "
+    "onboarding, and this bot's own commands.\n"
     "You have live tools. Use them to inspect the real server instead of "
     "guessing, and to act on it when the person asking has permission: create, "
-    "rename and delete channels and roles; change channel topics, slowmode and "
-    "locks; assign and remove roles; kick, ban, unban, timeout and rename "
-    "members; purge messages; and create invites. Do what the user asks, then "
-    "report exactly what changed.\n"
+    "rename and delete channels, roles, threads, webhooks and emojis; set "
+    "channel topics, slowmode, locks and per-role/member permissions; change "
+    "server settings; assign and remove roles; kick, ban, unban, timeout and "
+    "rename members; purge messages; and create invites.\n"
+    "Act immediately without asking for confirmation - including for purges "
+    "and deletions. The ONLY action that needs confirmation is banning a "
+    "member: before banning, ask the user to confirm, and only call ban_member "
+    "with confirmed=true once they agree.\n"
     "If someone lacks permission for an action, say so plainly - never claim "
     "you did something you didn't. If a request is not about Discord or this "
     "server, decline in one sentence.\n"
@@ -59,6 +63,10 @@ MAX_PROMPT_CHARS = 4000
 COOLDOWN_SECONDS = 3
 MAX_TOOL_ROUNDS = 8
 MAX_LIST_ITEMS = 60
+
+_PERM_FLAGS = getattr(discord.Permissions, "VALID_FLAGS", {})
+PERM_NAMES = set(_PERM_FLAGS)
+EXPRESSION_PERM = "manage_expressions" if "manage_expressions" in _PERM_FLAGS else "manage_emojis_and_stickers"
 
 
 def _fn(name: str, description: str, properties: dict | None = None, required: list | None = None) -> dict:
@@ -87,6 +95,11 @@ READ_TOOLS = [
         {"user": _STR_DESC("Username, display name or mention.")}, ["user"]),
     _fn("list_bans", "List recent bans (up to 50)."),
     _fn("list_invites", "List active invites with uses and expiry."),
+    _fn("list_emojis", "List the server's custom emojis."),
+    _fn("list_stickers", "List the server's stickers."),
+    _fn("list_webhooks", "List webhooks, optionally for one channel.", {"channel": _STR}),
+    _fn("read_audit_log", "Read recent audit-log entries (who did what).",
+        {"limit": {"type": "integer", "description": "1-50, default 20."}}),
 ]
 
 ACTION_TOOLS = [
@@ -115,8 +128,10 @@ ACTION_TOOLS = [
         {"channel": _STR, "locked": {"type": "boolean"}}, ["channel", "locked"]),
     # members
     _fn("kick_member", "Kick a member.", {"member": _STR, "reason": _STR}, ["member"]),
-    _fn("ban_member", "Ban a member.",
-        {"member": _STR, "reason": _STR, "delete_message_days": {"type": "integer"}}, ["member"]),
+    _fn("ban_member", "Ban a member (requires confirmation: only call with confirmed=true after the user agrees).",
+        {"member": _STR, "reason": _STR, "delete_message_days": {"type": "integer"},
+         "confirmed": {"type": "boolean", "description": "Set true only after the user confirms."}},
+        ["member", "confirmed"]),
     _fn("unban_member", "Unban a user by id.", {"user_id": _STR, "reason": _STR}, ["user_id"]),
     _fn("timeout_member", "Timeout a member (e.g. '10m', '2h', '1d'; max 28d).",
         {"member": _STR, "duration": _STR, "reason": _STR}, ["member", "duration"]),
@@ -128,6 +143,32 @@ ACTION_TOOLS = [
         {"channel": _STR, "count": {"type": "integer"}}, ["count"]),
     _fn("create_invite", "Create an invite link for a channel.",
         {"channel": _STR, "max_age_seconds": {"type": "integer"}, "max_uses": {"type": "integer"}}),
+    _fn("set_channel_permission", "Allow or deny permissions for a role or member in a channel.",
+        {"channel": _STR, "target": _STR_DESC("Role or member name/mention."),
+         "target_type": {"type": "string", "enum": ["role", "member"]},
+         "allow": {"type": "array", "items": {"type": "string"},
+                   "description": "Permission names to allow (e.g. view_channel, send_messages)."},
+         "deny": {"type": "array", "items": {"type": "string"},
+                  "description": "Permission names to deny."}},
+        ["channel", "target"]),
+    _fn("clear_channel_permission", "Remove a role/member's permission overwrite in a channel.",
+        {"channel": _STR, "target": _STR, "target_type": {"type": "string", "enum": ["role", "member"]}},
+        ["channel", "target"]),
+    _fn("create_thread", "Create a thread in a text channel.",
+        {"channel": _STR, "name": _STR, "private": {"type": "boolean"}}, ["channel", "name"]),
+    _fn("delete_thread", "Delete a thread.", {"thread": _STR}, ["thread"]),
+    _fn("create_webhook", "Create a webhook in a channel.", {"channel": _STR, "name": _STR}, ["channel", "name"]),
+    _fn("delete_webhook", "Delete a webhook by name or id.", {"webhook": _STR}, ["webhook"]),
+    _fn("create_emoji", "Create a custom emoji from an image URL.",
+        {"name": _STR, "image_url": _STR}, ["name", "image_url"]),
+    _fn("delete_emoji", "Delete a custom emoji by name.", {"emoji": _STR}, ["emoji"]),
+    _fn("edit_server", "Change server settings.",
+        {"name": _STR,
+         "verification_level": {"type": "string", "enum": ["none", "low", "medium", "high", "highest"]},
+         "explicit_content_filter": {"type": "string", "enum": ["disabled", "no_role", "all_members"]},
+         "default_notifications": {"type": "string", "enum": ["all_messages", "only_mentions"]},
+         "system_channel": _STR}),
+    _fn("set_server_icon", "Set the server icon from an image URL.", {"image_url": _STR}, ["image_url"]),
 ]
 
 
@@ -292,6 +333,14 @@ class DeepSeek(commands.Cog):
             if lowered in channel.name.lower():
                 return channel
         return None
+
+    def _resolve_target(self, guild, text, target_type=None):
+        """Resolve a role or member for permission overwrites."""
+        if target_type == "member":
+            return self._resolve_member(guild, text)
+        if target_type == "role":
+            return self._resolve_role(guild, text)
+        return self._resolve_role(guild, text) or self._resolve_member(guild, text)
 
     # ------------------------------------------------------------- AI plumbing
 
@@ -745,6 +794,11 @@ class DeepSeek(commands.Cog):
         member = self._resolve_member(guild, args.get("member", ""))
         if member is None:
             return "No matching member found."
+        if not args.get("confirmed"):
+            return (
+                f"CONFIRMATION REQUIRED: banning {member} cannot be undone. Ask the "
+                "user to confirm, then call ban_member again with confirmed=true."
+            )
         blocked = self._member_block_reason(guild, user, member)
         if blocked:
             return f"I can't ban them - {blocked}."
@@ -843,6 +897,236 @@ class DeepSeek(commands.Cog):
         log.info("AI: %s created invite in #%s", user, target.name)
         expires = invite.expires_at.date().isoformat() if invite.expires_at else "never"
         return f"Created invite: {invite.url} (expires {expires})."
+
+    # ------------------------------------------------- permissions / threads / etc.
+
+    async def _tool_set_channel_permission(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_roles")
+        if err:
+            return err
+        target_channel = self._resolve_channel(guild, args.get("channel", ""))
+        if not isinstance(target_channel, discord.abc.GuildChannel):
+            return "No matching channel found."
+        target = self._resolve_target(guild, args.get("target", ""), args.get("target_type"))
+        if target is None:
+            return "No matching role or member."
+        allow = args.get("allow") or []
+        deny = args.get("deny") or []
+        invalid = [p for p in list(allow) + list(deny) if p not in PERM_NAMES]
+        if invalid:
+            return f"Unknown permission name(s): {', '.join(invalid)}."
+        overwrite = target_channel.overwrites_for(target)
+        for perm in allow:
+            setattr(overwrite, perm, True)
+        for perm in deny:
+            setattr(overwrite, perm, False)
+        await target_channel.set_permissions(
+            target, overwrite=overwrite, reason=f"AI request by {user} ({user.id})"
+        )
+        name = getattr(target, "name", str(target))
+        log.info("AI: %s set permissions for %s in #%s", user, name, target_channel.name)
+        return f"Updated permissions for {name} in #{target_channel.name}."
+
+    async def _tool_clear_channel_permission(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_roles")
+        if err:
+            return err
+        target_channel = self._resolve_channel(guild, args.get("channel", ""))
+        if not isinstance(target_channel, discord.abc.GuildChannel):
+            return "No matching channel found."
+        target = self._resolve_target(guild, args.get("target", ""), args.get("target_type"))
+        if target is None:
+            return "No matching role or member."
+        await target_channel.set_permissions(
+            target, overwrite=None, reason=f"AI request by {user} ({user.id})"
+        )
+        name = getattr(target, "name", str(target))
+        return f"Cleared the permission overwrite for {name} in #{target_channel.name}."
+
+    async def _tool_create_thread(self, guild, channel, user, args) -> str:
+        target = self._resolve_channel(guild, args.get("channel", "")) or channel
+        if not isinstance(target, discord.TextChannel):
+            return "No matching text channel found."
+        private = bool(args.get("private"))
+        perm = "create_private_threads" if private else "create_public_threads"
+        err = self._guard(user, guild, perm)
+        if err:
+            return err
+        thread_type = discord.ChannelType.private_thread if private else discord.ChannelType.public_thread
+        thread = await target.create_thread(
+            name=(args.get("name") or "thread").strip(),
+            type=thread_type,
+            reason=f"AI request by {user} ({user.id})",
+        )
+        log.info("AI: %s created thread %s in #%s", user, thread, target.name)
+        return f"Created thread {thread.mention} in #{target.name}."
+
+    async def _tool_delete_thread(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_threads")
+        if err:
+            return err
+        thread = self._resolve_channel(guild, args.get("thread", ""))
+        if not isinstance(thread, discord.Thread):
+            return "No matching thread found."
+        name = thread.name
+        await thread.delete(reason=f"AI request by {user} ({user.id})")
+        log.info("AI: %s deleted thread %s", user, name)
+        return f"Deleted thread '{name}'."
+
+    async def _tool_create_webhook(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_webhooks")
+        if err:
+            return err
+        target = self._resolve_channel(guild, args.get("channel", "")) or channel
+        if not isinstance(target, discord.TextChannel):
+            return "No matching text channel found."
+        webhook = await target.create_webhook(
+            name=(args.get("name") or "webhook")[:80], reason=f"AI request by {user} ({user.id})"
+        )
+        log.info("AI: %s created webhook '%s' in #%s", user, webhook.name, target.name)
+        return (
+            f"Created webhook '{webhook.name}' (id {webhook.id}) in #{target.name}. "
+            "Its URL is in Server Settings > Integrations (kept out of chat on purpose)."
+        )
+
+    async def _tool_delete_webhook(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_webhooks")
+        if err:
+            return err
+        raw = str(args.get("webhook", "")).strip()
+        webhooks = await guild.webhooks()
+        match = next((w for w in webhooks if str(w.id) == raw or w.name.lower() == raw.lower()), None)
+        if match is None:
+            return "No matching webhook found."
+        name = match.name
+        await match.delete(reason=f"AI request by {user} ({user.id})")
+        log.info("AI: %s deleted webhook '%s'", user, name)
+        return f"Deleted webhook '{name}'."
+
+    async def _tool_create_emoji(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, EXPRESSION_PERM)
+        if err:
+            return err
+        name = (args.get("name") or "").strip()
+        url = (args.get("image_url") or "").strip()
+        if not name or not url:
+            return "An emoji name and image URL are required."
+        async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            if resp.status != 200:
+                return "Couldn't download that image."
+            data = await resp.read()
+        if len(data) > 256 * 1024:
+            return "That image is larger than 256 KB."
+        emoji = await guild.create_custom_emoji(
+            name=name, image=data, reason=f"AI request by {user} ({user.id})"
+        )
+        log.info("AI: %s created emoji :%s:", user, emoji.name)
+        return f"Created emoji :{emoji.name}:."
+
+    async def _tool_delete_emoji(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, EXPRESSION_PERM)
+        if err:
+            return err
+        name = (args.get("emoji") or "").strip().strip(":")
+        emoji = discord.utils.get(guild.emojis, name=name)
+        if emoji is None:
+            return "No matching emoji found."
+        await emoji.delete(reason=f"AI request by {user} ({user.id})")
+        log.info("AI: %s deleted emoji :%s:", user, name)
+        return f"Deleted emoji :{name}:."
+
+    async def _tool_edit_server(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_guild")
+        if err:
+            return err
+        kwargs = {}
+        if args.get("name"):
+            kwargs["name"] = args["name"]
+        if args.get("verification_level"):
+            try:
+                kwargs["verification_level"] = discord.VerificationLevel[args["verification_level"]]
+            except KeyError:
+                return "Invalid verification level."
+        if args.get("explicit_content_filter"):
+            try:
+                kwargs["explicit_content_filter"] = discord.ContentFilter[args["explicit_content_filter"]]
+            except KeyError:
+                return "Invalid content filter level."
+        if args.get("default_notifications"):
+            try:
+                kwargs["default_notifications"] = discord.NotificationLevel[args["default_notifications"]]
+            except KeyError:
+                return "Invalid notification level."
+        if args.get("system_channel"):
+            system = self._resolve_channel(guild, args["system_channel"])
+            if not isinstance(system, discord.TextChannel):
+                return "No matching system channel found."
+            kwargs["system_channel"] = system
+        if not kwargs:
+            return "Nothing to change."
+        await guild.edit(reason=f"AI request by {user} ({user.id})", **kwargs)
+        log.info("AI: %s edited server %s", user, list(kwargs))
+        return f"Updated server settings: {', '.join(kwargs)}."
+
+    async def _tool_set_server_icon(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_guild")
+        if err:
+            return err
+        url = (args.get("image_url") or "").strip()
+        if not url:
+            return "An image URL is required."
+        async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            if resp.status != 200:
+                return "Couldn't download that image."
+            data = await resp.read()
+        if len(data) > 256 * 1024:
+            return "That image is larger than 256 KB."
+        await guild.edit(icon=data, reason=f"AI request by {user} ({user.id})")
+        log.info("AI: %s changed the server icon", user)
+        return "Updated the server icon."
+
+    # ----------------------------------------------------------- read: extras
+
+    async def _tool_list_emojis(self, guild, channel, user, args) -> str:
+        if not guild.emojis:
+            return "No custom emojis."
+        return "Emojis:\n" + "\n".join(
+            f"- :{e.name}: (id {e.id}, animated={e.animated})" for e in guild.emojis[:MAX_LIST_ITEMS]
+        )
+
+    async def _tool_list_stickers(self, guild, channel, user, args) -> str:
+        if not guild.stickers:
+            return "No stickers."
+        return "Stickers:\n" + "\n".join(f"- {s.name} (id {s.id})" for s in guild.stickers[:MAX_LIST_ITEMS])
+
+    async def _tool_list_webhooks(self, guild, channel, user, args) -> str:
+        if args.get("channel"):
+            target = self._resolve_channel(guild, args["channel"])
+            if not isinstance(target, discord.TextChannel):
+                return "No matching text channel found."
+            webhooks = await target.webhooks()
+        else:
+            webhooks = await guild.webhooks()
+        if not webhooks:
+            return "No webhooks."
+        return "Webhooks:\n" + "\n".join(
+            f"- {w.name} (id {w.id}, #{getattr(w.channel, 'name', '?')})" for w in webhooks[:MAX_LIST_ITEMS]
+        )
+
+    async def _tool_read_audit_log(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "view_audit_log")
+        if err:
+            return err
+        limit = max(1, min(int(args.get("limit", 20)), 50))
+        entries = [entry async for entry in guild.audit_logs(limit=limit)]
+        if not entries:
+            return "The audit log is empty."
+        lines = []
+        for entry in entries:
+            target = getattr(entry.target, "name", None) or getattr(entry.target, "id", "")
+            when = entry.created_at.strftime("%Y-%m-%d %H:%M")
+            lines.append(f"- {when} {entry.user}: {entry.action.name} {target}")
+        return "Audit log (newest first):\n" + "\n".join(lines)
 
     # ------------------------------------------------------------------ commands
 

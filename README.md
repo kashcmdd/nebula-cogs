@@ -62,24 +62,30 @@ to set by editing this cog's `DEFAULT_SYSTEM` and restarting).
 
 ### Server tools
 
-The model uses **tool calling** for both live data and actions.
+**Read (10):** `server_info`, `list_roles`, `list_channels`, `member_info`,
+`list_bans`, `list_invites`, `list_emojis`, `list_stickers`, `list_webhooks`,
+`read_audit_log`.
 
-**Read:** `server_info`, `list_roles`, `list_channels`, `member_info`,
-`list_bans`, `list_invites`.
+**Act (31):**
+- **Roles:** `add_role`, `remove_role`, `create_role`, `edit_role`, `delete_role`
+- **Channels:** `create_text_channel`, `create_voice_channel`, `create_category`,
+  `delete_channel`, `rename_channel`, `set_channel_topic`, `set_slowmode`,
+  `set_channel_lock`
+- **Permissions:** `set_channel_permission`, `clear_channel_permission`
+- **Threads:** `create_thread`, `delete_thread`
+- **Members:** `kick_member`, `ban_member`, `unban_member`, `timeout_member`,
+  `remove_timeout`, `set_nickname`
+- **Messages:** `purge_messages`
+- **Invites:** `create_invite`
+- **Webhooks:** `create_webhook`, `delete_webhook`
+- **Emojis:** `create_emoji`, `delete_emoji`
+- **Server:** `edit_server`, `set_server_icon`
 
-**Act:** `add_role`, `remove_role`, `create_role`, `edit_role`, `delete_role`,
-`create_text_channel`, `create_voice_channel`, `create_category`,
-`delete_channel`, `rename_channel`, `set_channel_topic`, `set_slowmode`,
-`set_channel_lock`, `kick_member`, `ban_member`, `unban_member`,
-`timeout_member`, `remove_timeout`, `set_nickname`, `purge_messages`,
-`create_invite`.
-
-Every action is checked against the **requester's** Discord permission
-(Manage Channels / Roles, Kick / Ban Members, Moderate Members, Manage
-Nicknames, Manage Messages, Create Invite) at execution time — never the
-bot's — plus role-hierarchy rules, and is logged. A non-privileged user can't
-talk the bot into doing anything they couldn't do themselves. Disable all
-actions with `!aiset actions false`.
+Every action is checked against the **requester's** Discord permission at
+execution time — never the bot's — plus role-hierarchy rules, and is logged. The
+AI acts immediately, including purges and deletions; **banning is the only
+action that asks for confirmation first**. Disable all actions with
+`!aiset actions false`.
 
 ### Settings
 
