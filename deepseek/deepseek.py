@@ -152,7 +152,7 @@ class DeepSeek(commands.Cog):
     """Chat with DeepSeek via ``!ai`` or by mentioning the bot."""
 
     __author__ = ["Riley"]
-    __version__ = "1.1.0"
+    __version__ = "1.1.1"
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -262,6 +262,31 @@ class DeepSeek(commands.Cog):
         perms = getattr(user, "guild_permissions", None)
         return bool(perms and perms.manage_roles)
 
+    def _requester_context(
+        self, guild: discord.Guild, channel: discord.abc.Messageable, user: discord.abc.User
+    ) -> str:
+        """Tell the model who it is talking to, so 'me'/'my'/'I' resolve."""
+        parts = [
+            f"You are in the server '{guild.name}' (id {guild.id}), "
+            f"in #{getattr(channel, 'name', 'unknown')} (id {channel.id}).",
+            f"You are speaking with {user} (id {user.id}).",
+        ]
+        if isinstance(user, discord.Member):
+            roles = [role.name for role in user.roles if not role.is_default()]
+            parts.append(
+                "Their current roles: "
+                + (", ".join(roles) if roles else "none")
+                + f". Their highest role: {user.top_role.name}."
+            )
+            if self._can_manage_roles(user, guild):
+                parts.append("They are allowed to manage roles.")
+            else:
+                parts.append(
+                    "They are NOT allowed to manage roles - refuse any role change for them."
+                )
+        parts.append("Resolve words like 'me', 'my' and 'I' to this person.")
+        return " ".join(parts)
+
     async def _answer(
         self, guild: discord.Guild, channel: discord.abc.Messageable, user: discord.abc.User, prompt: str
     ) -> str:
@@ -273,7 +298,8 @@ class DeepSeek(commands.Cog):
 
         key = (guild.id, channel.id, user.id)
         history = self._history.setdefault(key, [])
-        messages = [{"role": "system", "content": system}]
+        system_with_context = f"{system}\n\n{self._requester_context(guild, channel, user)}"
+        messages = [{"role": "system", "content": system_with_context}]
         messages.extend(history[-max_history:])
         messages.append({"role": "user", "content": prompt})
 
