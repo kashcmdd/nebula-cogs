@@ -61,8 +61,12 @@ DEFAULT_SYSTEM = (
     "you did something you didn't. If a request is not about Discord or this "
     "server, decline in one sentence.\n"
     "Formatting: when posting an embed that lists several items (rules, steps, "
-    "options), give each item its own embed field (name = short heading, value "
-    "= the detail) instead of one long description, so it reads cleanly.\n"
+    "options), pass them as separate fields - send_embed's 'fields' argument is "
+    "a list of {name, value} objects (name = short heading, value = the detail). "
+    "Do not put a long list in the description.\n"
+    "When asked to replace or reformat an existing embed: read it first, delete "
+    "that exact message, then post ONE new embed. Never post the same thing "
+    "twice, and perform each change once.\n"
     "Be concise and practical, using correct Discord terminology. This bot's "
     "commands use the `!` prefix. If unsure, say so rather than guessing."
 )
@@ -189,7 +193,7 @@ ACTION_TOOLS = [
     _fn("set_server_icon", "Set the server icon from an image URL.", {"image_url": _STR}, ["image_url"]),
     _fn("send_message", "Post a message in a channel.",
         {"channel": _STR, "content": _STR, "reply_to_message_id": _STR}, ["content"]),
-    _fn("send_embed", "Post an embed in a channel. For lists (e.g. rules), use one field per item.",
+    _fn("send_embed", "Post an embed. For a list (e.g. rules), pass each item in 'fields' as {name, value} - do not put lists in 'description'.",
         {"channel": _STR, "title": _STR, "description": _STR,
          "colour": _STR_DESC("Hex like #7C3AED."), "footer": _STR,
          "image_url": _STR, "thumbnail_url": _STR,
@@ -1994,10 +1998,13 @@ class DeepSeek(commands.Cog):
             text = "Something went wrong handling that request - check the bot logs."
 
         async def send(content: str) -> None:
-            if in_ai_channel and not (mentioned or replied_to_bot):
+            try:
+                if in_ai_channel and not (mentioned or replied_to_bot):
+                    await message.channel.send(content)
+                else:
+                    await message.reply(content, mention_author=False)
+            except discord.HTTPException:
                 await message.channel.send(content)
-            else:
-                await message.reply(content, mention_author=False)
 
         try:
             await self._send(send, text)
