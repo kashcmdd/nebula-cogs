@@ -37,6 +37,36 @@ from redbot.core.utils.chat_formatting import pagify
 
 log = logging.getLogger("red.cogs.deepseek")
 
+
+def _ascii(value) -> str:
+    """Force a value to ASCII so logging can't fail on a non-UTF8 console."""
+    return str(value).encode("ascii", "backslashreplace").decode("ascii")
+
+
+class _AsciiSafeFilter(logging.Filter):
+    """Sanitise log records.
+
+    Red's Rich console handler raises UnicodeEncodeError on a cp1252 Windows
+    console when a record contains characters it can't encode (for example an
+    emoji in a channel name like '#📜・rules'). Because that happens inside
+    log.info(), the exception propagates out of the calling coroutine and can
+    abort a request after the action has already run. Sanitising the record
+    before it reaches any handler prevents that entirely.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = _ascii(record.msg)
+        if record.args:
+            if isinstance(record.args, dict):
+                record.args = {key: _ascii(value) for key, value in record.args.items()}
+            else:
+                record.args = tuple(_ascii(arg) for arg in record.args)
+        return True
+
+
+log.addFilter(_AsciiSafeFilter())
+
 API_URL = "https://api.deepseek.com/chat/completions"
 MODELS = ("deepseek-flash", "deepseek-v4-pro")
 DEFAULT_SYSTEM = (
