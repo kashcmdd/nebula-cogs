@@ -93,8 +93,8 @@ DEFAULT_SYSTEM = (
     "welcome messages for new members with set_welcome.\n"
     "For embeds with several sections (menus, role lists, rules), use "
     "send_sections; for self-assignable role menus use post_role_menu, which "
-    "adds the reactions and makes them actually grant/remove roles. Never claim "
-    "reactions assign roles unless you used post_role_menu.\n"
+    "posts buttons that actually grant/remove roles (set separate=true to post "
+    "one menu per section). Prefer buttons over reactions for roles.\n"
     "Act immediately without asking for confirmation - including for purges "
     "and deletions. The ONLY action that needs confirmation is banning a "
     "member: before banning, ask the user to confirm, and only call ban_member "
@@ -346,8 +346,9 @@ ACTION_TOOLS = [
          "sections": {"type": "array", "items": {"type": "object", "properties": {
              "heading": _STR, "items": {"type": "array", "items": _STR}}}}},
         ["sections"]),
-    _fn("post_role_menu", "Post a WORKING reaction-role menu: users react to get/remove a role.",
+    _fn("post_role_menu", "Post a button role menu: users click buttons to get/remove a role.",
         {"channel": _STR, "title": _STR, "intro": _STR, "footer": _STR,
+         "separate": {"type": "boolean", "description": "Post one separate menu per section."},
          "sections": {"type": "array", "items": {"type": "object", "properties": {
              "heading": _STR,
              "exclusive": {"type": "boolean",
@@ -375,7 +376,7 @@ class DeepSeek(commands.Cog):
     """A DeepSeek assistant that can read and manage the server."""
 
     __author__ = ["Riley"]
-    __version__ = "1.7.0"
+    __version__ = "1.8.0"
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -2255,99 +2256,124 @@ class DeepSeek(commands.Cog):
         sections = args.get("sections") or []
         if not sections:
             return "Provide at least one section."
+        separate = bool(args.get("separate"))
+        title = str(args.get("title") or "Self-Assignable Roles")[:256]
+        intro = str(args.get("intro") or "")[:4000]
+        footer = str(args.get("footer") or "")[:2048]
 
-        embed = discord.Embed(colour=discord.Colour(await self.bot._config.color()))
-        if args.get("title"):
-            embed.title = str(args["title"])[:256]
-        if args.get("intro"):
-            embed.description = str(args["intro"])[:4000]
-        if args.get("footer"):
-            embed.set_footer(text=str(args["footer"])[:2048])
-
-        mapping: dict = {}
+        posted = 0
         for section in sections[:10]:
             heading = str(section.get("heading") or "Roles").strip()[:256]
             group = heading if section.get("exclusive") else None
-            lines = []
-            for item in (section.get("roles") or [])[:20]:
-                emoji = str(item.get("emoji") or "").strip()
+            buttons = []
+            mapping: dict = {}
+            for item in (section.get("roles") or [])[:25]:
                 role = self._resolve_role(guild, item.get("role", ""))
-                if not emoji or role is None or role.is_default():
+                if role is None or role.is_default():
                     continue
                 if role.position >= guild.me.top_role.position:
                     continue
-                lines.append(f"{emoji} — {role.name}")
-                mapping[emoji] = {"role_id": role.id, "group": group}
-            if lines:
-                embed.add_field(name=heading or "\u200b", value="\n".join(lines)[:1024], inline=False)
+                emoji = str(item.get("emoji") or "").strip() or None
+                mapping[str(role.id)] = {"group": group}
+                buttons.append((emoji, role))
+            if not buttons:
+                continue
 
-        if not mapping:
+            embed = discord.Embed(colour=discord.Colour(await self.bot._config.color()))
+            embed.title = title
+            if intro:
+                embed.description = intro
+            embed.add_field(
+                name=heading,
+                value="\n".join(f"{e} — {r.name}" if e else r.name for e, r in buttons)[:1024],
+                inline=False,
+            )
+            if footer:
+                embed.set_footer(text=footer)
+
+            view = discord.ui.View(timeout=None)
+            for index, (emoji, role) in enumerate(buttons):
+                view.add_item(
+                    discord.ui.Button(
+                        style=discord.ButtonStyle.secondary,
+                        label=role.name[:80],
+                        custom_id=f"rr|{role.id}",
+                        emoji=emoji,
+                        row=index // 5,
+                    )
+                )
+            message = await target.send(embed=embed, view=view)
+            async with self.config.guild(guild).react_roles() as data:
+                data[str(message.id)] = {"roles": mapping}
+            posted += 1
+            if not separate:
+                break
+
+        if not posted:
             return "I couldn't match any usable roles for the menu."
+        log.info("AI: %s posted %d role menu(s) in #%s", user, posted, target.name)
+        if posted == 1:
+            return f"Posted a button role menu in #{target.name}."
+        return f"Posted {posted} separate button role menus in #{target.name}."
 
-        message = await target.send(embed=embed)
-        for emoji in mapping:
-            try:
-                await message.add_reaction(emoji)
-            except discord.HTTPException:
-                log.warning("Couldn't add reaction %s", _ascii(emoji))
-        async with self.config.guild(guild).react_roles() as data:
-            data[str(message.id)] = {"roles": mapping}
-        log.info("AI: %s posted a role menu (%d roles) in #%s", user, len(mapping), target.name)
-        return f"Posted a working reaction-role menu in #{target.name} (message id {message.id})."
-
-    async def _apply_reaction_role(self, payload, add: bool) -> None:
-        if payload.guild_id is None or payload.user_id == self.bot.user.id:
+    async def _handle_role_button(self, interaction: discord.Interaction, custom_id: str) -> None:
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            await interaction.response.send_message("Role menus only work in a server.", ephemeral=True)
             return
-        guild = self.bot.get_guild(payload.guild_id)
-        if guild is None:
+        try:
+            role_id = int(custom_id.split("|", 1)[1])
+        except (IndexError, ValueError):
             return
-        data = await self.config.guild(guild).react_roles()
-        entry = data.get(str(payload.message_id))
+        entry = None
+        if interaction.message is not None:
+            data = await self.config.guild(guild).react_roles()
+            entry = data.get(str(interaction.message.id))
         if not entry:
+            await interaction.response.send_message("This role menu is no longer active.", ephemeral=True)
             return
-        mapping = (entry.get("roles") or {}).get(str(payload.emoji))
-        if not mapping:
-            return
-        member = guild.get_member(payload.user_id)
-        if member is None:
-            try:
-                member = await guild.fetch_member(payload.user_id)
-            except discord.HTTPException:
-                return
-        role = guild.get_role(mapping.get("role_id"))
-        if role is None:
+        mapping = (entry.get("roles") or {}).get(str(role_id))
+        role = guild.get_role(role_id)
+        if mapping is None or role is None:
+            await interaction.response.send_message("That role is no longer available.", ephemeral=True)
             return
         if not guild.me.guild_permissions.manage_roles or role.position >= guild.me.top_role.position:
+            await interaction.response.send_message(
+                "I can't manage that role - check my role position.", ephemeral=True
+            )
             return
         try:
-            if add:
-                group = mapping.get("group")
-                if group:
-                    for other_emoji, other in (entry.get("roles") or {}).items():
-                        if other.get("group") == group and other_emoji != str(payload.emoji):
-                            other_role = guild.get_role(other.get("role_id"))
-                            if other_role and other_role in member.roles:
-                                await member.remove_roles(other_role, reason="Reaction role (exclusive)")
-                if role not in member.roles:
-                    await member.add_roles(role, reason="Reaction role")
-            elif role in member.roles:
-                await member.remove_roles(role, reason="Reaction role")
+            if role in member.roles:
+                await member.remove_roles(role, reason="Role menu")
+                await interaction.response.send_message(f"Removed **{role.name}**.", ephemeral=True)
+                return
+            group = mapping.get("group")
+            if group:
+                for other_id, other in (entry.get("roles") or {}).items():
+                    if other.get("group") == group and other_id != str(role_id):
+                        other_role = guild.get_role(int(other_id))
+                        if other_role and other_role in member.roles:
+                            await member.remove_roles(other_role, reason="Role menu (exclusive)")
+            await member.add_roles(role, reason="Role menu")
+            await interaction.response.send_message(f"Gave you **{role.name}**.", ephemeral=True)
         except discord.HTTPException:
-            log.warning("Reaction role update failed in guild %s", guild.id)
+            log.warning("Role menu update failed in guild %s", guild.id)
+            try:
+                await interaction.response.send_message("That didn't work - try again.", ephemeral=True)
+            except discord.HTTPException:
+                pass
 
     @commands.Cog.listener()
-    async def on_raw_reaction_add(self, payload):
+    async def on_interaction(self, interaction: discord.Interaction):
         try:
-            await self._apply_reaction_role(payload, True)
+            if interaction.type != discord.InteractionType.component:
+                return
+            custom_id = (interaction.data or {}).get("custom_id", "")
+            if isinstance(custom_id, str) and custom_id.startswith("rr|"):
+                await self._handle_role_button(interaction, custom_id)
         except Exception:  # noqa: BLE001
-            log.exception("Reaction-role add failed")
-
-    @commands.Cog.listener()
-    async def on_raw_reaction_remove(self, payload):
-        try:
-            await self._apply_reaction_role(payload, False)
-        except Exception:  # noqa: BLE001
-            log.exception("Reaction-role remove failed")
+            log.exception("Role-button handling failed")
 
     # ------------------------------------------------------------------ commands
 
