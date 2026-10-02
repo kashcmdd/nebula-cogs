@@ -1439,11 +1439,19 @@ class DeepSeek(commands.Cog):
             embed.title = str(args["title"])[:256]
         if description:
             embed.description = description[:4000]
-        if args.get("colour"):
+        colour = args.get("colour")
+        if colour:
             try:
-                embed.colour = discord.Colour.from_str(args["colour"])
+                embed.colour = discord.Colour.from_str(colour)
             except ValueError:
-                return f"'{args['colour']}' isn't a valid hex colour."
+                return f"'{colour}' isn't a valid hex colour."
+        else:
+            # Fall back to the bot's configured brand colour so embeds never
+            # come out default-grey just because the model omitted it.
+            try:
+                embed.colour = discord.Colour(await self.bot._config.color())
+            except Exception:  # noqa: BLE001 - colour is cosmetic
+                pass
         if args.get("footer"):
             embed.set_footer(text=str(args["footer"])[:2048])
         if args.get("image_url"):
