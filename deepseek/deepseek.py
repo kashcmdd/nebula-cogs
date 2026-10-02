@@ -82,7 +82,8 @@ DEFAULT_SYSTEM = (
     "server settings; assign and remove roles; kick, ban, unban, timeout and "
     "rename members; purge messages; send DMs; create invites and scheduled "
     "events; moderate voice; manage AutoMod rules; reorder roles and channels; "
-    "update server settings; and manage stickers.\n"
+    "update server settings; and manage stickers. You can also set up automatic "
+    "welcome messages for new members with set_welcome.\n"
     "Act immediately without asking for confirmation - including for purges "
     "and deletions. The ONLY action that needs confirmation is banning a "
     "member: before banning, ask the user to confirm, and only call ban_member "
@@ -298,6 +299,15 @@ ACTION_TOOLS = [
         {"name": _STR, "description": _STR, "tags": _STR_DESC("A unicode emoji or short text."),
          "image_url": _STR}, ["name", "description", "tags", "image_url"]),
     _fn("delete_sticker", "Delete a sticker by name.", {"sticker": _STR}, ["sticker"]),
+    _fn("set_welcome", "Set up automatic welcome messages for new members.",
+        {"channel": _STR,
+         "message": _STR_DESC("Template; supports {user}, {name}, {server}, {count}."),
+         "embed": {"type": "boolean"}, "enabled": {"type": "boolean"},
+         "ai": {"type": "boolean", "description": "Write a personalised welcome with the AI."}},
+        ["channel"]),
+    _fn("disable_welcome", "Turn off automatic welcome messages."),
+    _fn("get_welcome", "Show the current welcome-message settings."),
+    _fn("test_welcome", "Post a sample welcome to the configured channel."),
 ]
 
 
@@ -318,7 +328,7 @@ class DeepSeek(commands.Cog):
     """A DeepSeek assistant that can read and manage the server."""
 
     __author__ = ["Riley"]
-    __version__ = "1.4.0"
+    __version__ = "1.5.0"
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -332,6 +342,11 @@ class DeepSeek(commands.Cog):
             ai_channel=None,
             respond_to_mentions=True,
             allow_actions=True,
+            welcome_channel=None,
+            welcome_message="Welcome {user} to **{server}**! Please read the rules and say hi.",
+            welcome_embed=True,
+            welcome_enabled=False,
+            welcome_ai=False,
         )
         self.session: Optional[aiohttp.ClientSession] = None
         self.api_key: Optional[str] = None
@@ -1950,6 +1965,122 @@ class DeepSeek(commands.Cog):
             where = getattr(event.channel, "name", None) or (event.location or "")
             lines.append(f"- {event.name} (id {event.id}) {event.status.name}, starts {when} UTC, {where}")
         return "Scheduled events:\n" + "\n".join(lines)
+
+    # ----------------------------------------------------------- welcome tools
+
+    @staticmethod
+    def _render_template(template: str, member) -> str:
+        return (
+            str(template)
+            .replace("{user}", member.mention)
+            .replace("{name}", member.display_name)
+            .replace("{username}", member.name)
+            .replace("{server}", member.guild.name)
+            .replace("{count}", str(member.guild.member_count))
+        )
+
+    async def _generate_welcome(self, member) -> Optional[str]:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You write ONE short, warm welcome message (max 2 sentences) for a new "
+                    "Discord member. Plain text, no headings, no emoji spam."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Welcome {member.display_name} to the server '{member.guild.name}'.",
+            },
+        ]
+        try:
+            message = await self._request(member.guild, messages, [])
+        except (MissingKey, ApiError, aiohttp.ClientError, asyncio.TimeoutError):
+            return None
+        return (message.get("content") or "").strip() or None
+
+    async def _send_welcome(self, member) -> bool:
+        conf = self.config.guild(member.guild)
+        if not await conf.welcome_enabled():
+            return False
+        channel_id = await conf.welcome_channel()
+        channel = member.guild.get_channel(channel_id) if channel_id else None
+        if not isinstance(channel, discord.TextChannel):
+            return False
+
+        text = self._render_template(await conf.welcome_message(), member)
+        if await conf.welcome_ai() and self.api_key:
+            generated = await self._generate_welcome(member)
+            if generated:
+                text = generated
+
+        try:
+            if await conf.welcome_embed():
+                embed = discord.Embed(
+                    title=f"Welcome to {member.guild.name}!",
+                    description=text,
+                    colour=discord.Colour(await self.bot._config.color()),
+                )
+                embed.set_thumbnail(url=member.display_avatar.url)
+                embed.set_footer(text=f"You are member #{member.guild.member_count}")
+                await channel.send(content=member.mention, embed=embed)
+            else:
+                await channel.send(f"{member.mention} {text}")
+        except discord.HTTPException:
+            log.warning("Welcome message failed in guild %s", member.guild.id)
+            return False
+        log.info("AI: welcomed %s in #%s", member, channel.name)
+        return True
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        try:
+            await self._send_welcome(member)
+        except Exception:  # noqa: BLE001 - a join must never error the bot
+            log.exception("Welcome handling failed")
+
+    async def _tool_set_welcome(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_guild")
+        if err:
+            return err
+        target = self._resolve_channel(guild, args.get("channel", ""))
+        if not isinstance(target, discord.TextChannel):
+            return "No matching text channel found."
+        conf = self.config.guild(guild)
+        await conf.welcome_channel.set(target.id)
+        if args.get("message") is not None:
+            await conf.welcome_message.set(str(args["message"]))
+        if args.get("embed") is not None:
+            await conf.welcome_embed.set(bool(args["embed"]))
+        if args.get("ai") is not None:
+            await conf.welcome_ai.set(bool(args["ai"]))
+        await conf.welcome_enabled.set(bool(args.get("enabled", True)))
+        if await conf.welcome_ai() and not self.api_key:
+            return f"Welcome enabled in #{target.name}, but AI needs an API key (`!set api deepseek api_key`)."
+        return f"Welcome messages enabled in #{target.name}."
+
+    async def _tool_disable_welcome(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_guild")
+        if err:
+            return err
+        await self.config.guild(guild).welcome_enabled.set(False)
+        return "Welcome messages disabled."
+
+    async def _tool_get_welcome(self, guild, channel, user, args) -> str:
+        settings = await self.config.guild(guild).all()
+        chan = f"<#{settings['welcome_channel']}>" if settings.get("welcome_channel") else "None"
+        return (
+            f"Enabled: {settings['welcome_enabled']}\nChannel: {chan}\n"
+            f"Embed: {settings['welcome_embed']}\nAI: {settings['welcome_ai']}\n"
+            f"Message: {settings['welcome_message']}"
+        )
+
+    async def _tool_test_welcome(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_guild")
+        if err:
+            return err
+        sent = await self._send_welcome(user)
+        return "Sent a sample welcome." if sent else "No welcome channel configured, or welcomes are disabled."
 
     # ------------------------------------------------------------------ commands
 
