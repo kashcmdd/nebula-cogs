@@ -98,6 +98,13 @@ DEFAULT_SYSTEM = (
     "When asked to replace or reformat an existing embed: read it first, delete "
     "that exact message, then post ONE new embed. Never post the same thing "
     "twice, and perform each change once.\n"
+    "Resolve names yourself: match a channel, role or member on any part of its "
+    "name, ignoring emoji, symbols and prefixes (e.g. 'introductions' matches "
+    "'#👋・introductions'). Never ask the user to paste an exact name or id - "
+    "look it up with your tools and pick the best match.\n"
+    "When the user gives a clear instruction, carry it out straight away. Do not "
+    "ask for confirmation and do not repeat the question; only ask if two or "
+    "more things match well enough to be genuinely ambiguous.\n"
     "Be concise and practical, using correct Discord terminology. This bot's "
     "commands use the `!` prefix. If unsure, say so rather than guessing."
 )
@@ -113,6 +120,11 @@ EXPRESSION_PERM = "manage_expressions" if "manage_expressions" in _PERM_FLAGS el
 _ITEM_RE = re.compile(
     r"^\s*(?:\*\*|__)?\s*(?:(?P<num>\d+)[.)]\s*|[-*•]\s+)(?P<title>.+?)(?:\*\*|__)?\s*$"
 )
+
+
+def _norm(text: str) -> str:
+    """Normalise a name for matching: lowercase, alphanumerics only."""
+    return re.sub(r"[^a-z0-9]", "", str(text).lower())
 
 # Keyword -> emoji, for decorating rule/list field names. First match wins.
 _EMOJI_HINTS = [
@@ -338,7 +350,7 @@ class DeepSeek(commands.Cog):
     """A DeepSeek assistant that can read and manage the server."""
 
     __author__ = ["Riley"]
-    __version__ = "1.6.0"
+    __version__ = "1.6.1"
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -539,6 +551,11 @@ class DeepSeek(commands.Cog):
         for member in guild.members:
             if lowered in member.name.lower() or lowered in member.display_name.lower():
                 return member
+        norm = _norm(lowered)
+        if norm:
+            for member in guild.members:
+                if norm in _norm(member.name) or norm in _norm(member.display_name):
+                    return member
         return None
 
     @staticmethod
@@ -556,6 +573,11 @@ class DeepSeek(commands.Cog):
         for role in guild.roles:
             if lowered in role.name.lower():
                 return role
+        norm = _norm(lowered)
+        if norm:
+            for role in guild.roles:
+                if norm in _norm(role.name):
+                    return role
         return None
 
     @staticmethod
@@ -573,6 +595,11 @@ class DeepSeek(commands.Cog):
         for channel in guild.channels:
             if lowered in channel.name.lower():
                 return channel
+        norm = _norm(lowered)
+        if norm:
+            for channel in guild.channels:
+                if norm in _norm(channel.name):
+                    return channel
         return None
 
     def _resolve_target(self, guild, text, target_type=None):
