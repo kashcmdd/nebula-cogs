@@ -113,6 +113,24 @@ _ITEM_RE = re.compile(
     r"^\s*(?:\*\*|__)?\s*(?:(?P<num>\d+)[.)]\s*|[-*•]\s+)(?P<title>.+?)(?:\*\*|__)?\s*$"
 )
 
+# Keyword -> emoji, for decorating rule/list field names. First match wins.
+_EMOJI_HINTS = [
+    (("respect", "harass", "hate", "discrimin", "attack", "be kind"), "🛡️"),
+    (("spam", "advert", "self-promo", "promo", "flood"), "🚫"),
+    (("nsfw", "gore", "appropriate", "sexual", "disturbing", "explicit"), "🔞"),
+    (("english", "language"), "🗣️"),
+    (("channel", "topic", "off-topic", "right place"), "📁"),
+    (("illegal", "piracy", "hack", "drug"), "⚖️"),
+    (("doxx", "privacy", "personal info"), "🔒"),
+    (("staff", "moderator", "admin"), "👮"),
+    (("alt", "evasion", "multi-account"), "🚷"),
+    (("terms", "tos", "guidelines"), "📜"),
+    (("name", "nickname", "avatar", "username"), "🪪"),
+    (("voice", "soundboard", "mic"), "🔊"),
+    (("dm", "direct message"), "✉️"),
+]
+_DEFAULT_EMOJIS = ["🔹", "🔸", "💠", "🔻", "🔺", "◾", "▪️", "🔘", "⚪", "🟣"]
+
 
 def _fn(name: str, description: str, properties: dict | None = None, required: list | None = None) -> dict:
     return {
@@ -1389,6 +1407,23 @@ class DeepSeek(commands.Cog):
         return f"Posted in #{target.name} (message id {message.id})."
 
     @staticmethod
+    def _decorate_field_name(name: str, index: int) -> str:
+        """Style a list field name as 'emoji N · Title' (idempotent)."""
+        name = (name or "").strip()
+        if not name:
+            return name
+        if " · " in name or ord(name[0]) > 0x2000:  # already decorated
+            return name
+        lowered = name.lower()
+        emoji = next((e for keys, e in _EMOJI_HINTS if any(k in lowered for k in keys)), None)
+        if emoji is None:
+            emoji = _DEFAULT_EMOJIS[index % len(_DEFAULT_EMOJIS)]
+        match = re.match(r"^(\d+)[.)]\s*(.+)$", name)
+        if match:
+            return f"{emoji} {match.group(1)} · {match.group(2).strip()}"
+        return f"{emoji} {name}"
+
+    @staticmethod
     def _split_list(text: str):
         """Split a list-like description into (preamble, [(num, title, body)]).
 
@@ -1458,9 +1493,10 @@ class DeepSeek(commands.Cog):
             embed.set_image(url=args["image_url"])
         if args.get("thumbnail_url"):
             embed.set_thumbnail(url=args["thumbnail_url"])
-        for field in fields[:25]:
+        for index, field in enumerate(fields[:25]):
+            name = self._decorate_field_name(str(field.get("name", "")), index)
             embed.add_field(
-                name=str(field.get("name", ""))[:256] or "\u200b",
+                name=name[:256] or "\u200b",
                 value=str(field.get("value", ""))[:1024] or "\u200b",
                 inline=bool(field.get("inline", False)),
             )
