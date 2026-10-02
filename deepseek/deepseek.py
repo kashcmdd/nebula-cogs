@@ -60,6 +60,9 @@ DEFAULT_SYSTEM = (
     "If someone lacks permission for an action, say so plainly - never claim "
     "you did something you didn't. If a request is not about Discord or this "
     "server, decline in one sentence.\n"
+    "Formatting: when posting an embed that lists several items (rules, steps, "
+    "options), give each item its own embed field (name = short heading, value "
+    "= the detail) instead of one long description, so it reads cleanly.\n"
     "Be concise and practical, using correct Discord terminology. This bot's "
     "commands use the `!` prefix. If unsure, say so rather than guessing."
 )
@@ -185,7 +188,7 @@ ACTION_TOOLS = [
     _fn("set_server_icon", "Set the server icon from an image URL.", {"image_url": _STR}, ["image_url"]),
     _fn("send_message", "Post a message in a channel.",
         {"channel": _STR, "content": _STR, "reply_to_message_id": _STR}, ["content"]),
-    _fn("send_embed", "Post an embed in a channel.",
+    _fn("send_embed", "Post an embed in a channel. For lists (e.g. rules), use one field per item.",
         {"channel": _STR, "title": _STR, "description": _STR,
          "colour": _STR_DESC("Hex like #7C3AED."), "footer": _STR,
          "image_url": _STR, "thumbnail_url": _STR,
@@ -564,6 +567,7 @@ class DeepSeek(commands.Cog):
             tools += ACTION_TOOLS
 
         reply: Optional[str] = None
+        tool_results: list[str] = []
         for _ in range(MAX_TOOL_ROUNDS):
             try:
                 message = await self._request(guild, messages, tools)
@@ -586,7 +590,13 @@ class DeepSeek(commands.Cog):
 
             tool_calls = message.get("tool_calls")
             if not tool_calls:
-                reply = (message.get("content") or "").strip() or "I couldn't produce a reply."
+                content = (message.get("content") or "").strip()
+                if content:
+                    reply = content
+                elif tool_results:
+                    reply = "Done:\n" + "\n".join(f"- {result}" for result in tool_results[-6:])
+                else:
+                    reply = "I couldn't produce a reply."
                 break
 
             messages.append(
@@ -594,6 +604,7 @@ class DeepSeek(commands.Cog):
             )
             for call in tool_calls:
                 result = await self._execute_tool(guild, channel, user, call)
+                tool_results.append(result)
                 messages.append({"role": "tool", "tool_call_id": call.get("id"), "content": result})
         else:
             reply = "I hit my tool-use limit for that request. Try smaller steps."
@@ -628,6 +639,9 @@ class DeepSeek(commands.Cog):
             return "Discord refused that action (missing permissions)."
         except discord.HTTPException as exc:
             return f"Discord error: {exc}"
+        except Exception as exc:  # noqa: BLE001 - never let one tool kill the reply
+            log.exception("Tool %s failed", name)
+            return f"The '{name}' action failed: {exc}"
 
     # ---------------------------------------------------------------- read tools
 
@@ -1797,8 +1811,12 @@ class DeepSeek(commands.Cog):
         prompt = prompt.strip()[:MAX_PROMPT_CHARS]
         if not prompt:
             return await ctx.send_help()
-        async with ctx.typing():
-            text = await self._answer(ctx.guild, ctx.channel, ctx.author, prompt)
+        try:
+            async with ctx.typing():
+                text = await self._answer(ctx.guild, ctx.channel, ctx.author, prompt)
+        except Exception:  # noqa: BLE001
+            log.exception("DeepSeek command failed in guild %s", ctx.guild.id)
+            text = "Something went wrong handling that request - check the bot logs."
         await self._send(lambda content: ctx.reply(content, mention_author=False), text)
 
     @commands.command(name="aiclear")
@@ -1946,6 +1964,9 @@ class DeepSeek(commands.Cog):
                 text = await self._answer(message.guild, message.channel, message.author, prompt)
         except (discord.Forbidden, discord.HTTPException):
             return
+        except Exception:  # noqa: BLE001 - never leave the user with no reply
+            log.exception("DeepSeek failed to answer in guild %s", message.guild.id)
+            text = "Something went wrong handling that request - check the bot logs."
 
         async def send(content: str) -> None:
             if in_ai_channel and not (mentioned or replied_to_bot):
