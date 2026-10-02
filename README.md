@@ -62,11 +62,11 @@ to set by editing this cog's `DEFAULT_SYSTEM` and restarting).
 
 ### Server tools
 
-**Read (10):** `server_info`, `list_roles`, `list_channels`, `member_info`,
+**Read (11):** `server_info`, `list_roles`, `list_channels`, `member_info`,
 `list_bans`, `list_invites`, `list_emojis`, `list_stickers`, `list_webhooks`,
-`read_audit_log`.
+`read_audit_log`, `read_messages`.
 
-**Act (31):**
+**Act (39):**
 - **Roles:** `add_role`, `remove_role`, `create_role`, `edit_role`, `delete_role`
 - **Channels:** `create_text_channel`, `create_voice_channel`, `create_category`,
   `delete_channel`, `rename_channel`, `set_channel_topic`, `set_slowmode`,
@@ -75,7 +75,9 @@ to set by editing this cog's `DEFAULT_SYSTEM` and restarting).
 - **Threads:** `create_thread`, `delete_thread`
 - **Members:** `kick_member`, `ban_member`, `unban_member`, `timeout_member`,
   `remove_timeout`, `set_nickname`
-- **Messages:** `purge_messages`
+- **Messages:** `send_message`, `send_embed`, `edit_message`, `delete_message`,
+  `pin_message`, `unpin_message`, `react_to_message`, `purge_messages`
+- **DMs:** `dm_user`
 - **Invites:** `create_invite`
 - **Webhooks:** `create_webhook`, `delete_webhook`
 - **Emojis:** `create_emoji`, `delete_emoji`

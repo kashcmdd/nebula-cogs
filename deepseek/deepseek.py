@@ -46,9 +46,10 @@ DEFAULT_SYSTEM = (
     "You have live tools. Use them to inspect the real server instead of "
     "guessing, and to act on it when the person asking has permission: create, "
     "rename and delete channels, roles, threads, webhooks and emojis; set "
-    "channel topics, slowmode, locks and per-role/member permissions; change "
+    "channel topics, slowmode, locks and per-role/member permissions; post "
+    "messages and embeds; read, edit, pin, react to and delete messages; change "
     "server settings; assign and remove roles; kick, ban, unban, timeout and "
-    "rename members; purge messages; and create invites.\n"
+    "rename members; purge messages; send DMs; and create invites.\n"
     "Act immediately without asking for confirmation - including for purges "
     "and deletions. The ONLY action that needs confirmation is banning a "
     "member: before banning, ask the user to confirm, and only call ban_member "
@@ -100,6 +101,8 @@ READ_TOOLS = [
     _fn("list_webhooks", "List webhooks, optionally for one channel.", {"channel": _STR}),
     _fn("read_audit_log", "Read recent audit-log entries (who did what).",
         {"limit": {"type": "integer", "description": "1-50, default 20."}}),
+    _fn("read_messages", "Read recent messages in a channel (ids, authors, content).",
+        {"channel": _STR, "limit": {"type": "integer", "description": "1-50, default 20."}}),
 ]
 
 ACTION_TOOLS = [
@@ -169,6 +172,22 @@ ACTION_TOOLS = [
          "default_notifications": {"type": "string", "enum": ["all_messages", "only_mentions"]},
          "system_channel": _STR}),
     _fn("set_server_icon", "Set the server icon from an image URL.", {"image_url": _STR}, ["image_url"]),
+    _fn("send_message", "Post a message in a channel.",
+        {"channel": _STR, "content": _STR, "reply_to_message_id": _STR}, ["content"]),
+    _fn("send_embed", "Post an embed in a channel.",
+        {"channel": _STR, "title": _STR, "description": _STR,
+         "colour": _STR_DESC("Hex like #7C3AED."), "footer": _STR,
+         "image_url": _STR, "thumbnail_url": _STR,
+         "fields": {"type": "array", "items": {"type": "object", "properties": {
+             "name": _STR, "value": _STR, "inline": {"type": "boolean"}}}}}),
+    _fn("edit_message", "Edit one of the bot's own messages.",
+        {"channel": _STR, "message_id": _STR, "content": _STR}, ["message_id", "content"]),
+    _fn("delete_message", "Delete a message by id.", {"channel": _STR, "message_id": _STR}, ["message_id"]),
+    _fn("pin_message", "Pin a message by id.", {"channel": _STR, "message_id": _STR}, ["message_id"]),
+    _fn("unpin_message", "Unpin a message by id.", {"channel": _STR, "message_id": _STR}, ["message_id"]),
+    _fn("react_to_message", "Add a reaction to a message by id.",
+        {"channel": _STR, "message_id": _STR, "emoji": _STR}, ["message_id", "emoji"]),
+    _fn("dm_user", "Send a direct message to a member.", {"user": _STR, "content": _STR}, ["user", "content"]),
 ]
 
 
@@ -189,7 +208,7 @@ class DeepSeek(commands.Cog):
     """A DeepSeek assistant that can read and manage the server."""
 
     __author__ = ["Riley"]
-    __version__ = "1.2.0"
+    __version__ = "1.3.0"
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -247,6 +266,23 @@ class DeepSeek(commands.Cog):
         if not self._bot_has(guild, perm):
             return f"I don't have the '{perm.replace('_', ' ')}' permission for that."
         return None
+
+    def _guard_message(self, user, channel) -> Optional[str]:
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return "I can only post in a text channel or thread."
+        is_owner = user.id in self.bot.owner_ids or getattr(channel.guild, "owner_id", None) == user.id
+        may_manage = isinstance(user, discord.Member) and channel.permissions_for(user).manage_messages
+        if not (is_owner or may_manage):
+            return "You need the Manage Messages permission to do that."
+        if not channel.permissions_for(channel.guild.me).send_messages:
+            return "I don't have permission to send messages in that channel."
+        return None
+
+    async def _fetch_message(self, channel, message_id):
+        try:
+            return await channel.fetch_message(int(message_id))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError, TypeError):
+            return None
 
     def _can_manage_roles(self, user, guild) -> bool:
         if user.id in self.bot.owner_ids or guild.owner_id == user.id:
@@ -1127,6 +1163,153 @@ class DeepSeek(commands.Cog):
             when = entry.created_at.strftime("%Y-%m-%d %H:%M")
             lines.append(f"- {when} {entry.user}: {entry.action.name} {target}")
         return "Audit log (newest first):\n" + "\n".join(lines)
+
+    # ---------------------------------------------------------- message tools
+
+    def _target_channel(self, guild, channel, args):
+        if args.get("channel"):
+            return self._resolve_channel(guild, args["channel"])
+        return channel
+
+    async def _tool_send_message(self, guild, channel, user, args) -> str:
+        target = self._target_channel(guild, channel, args)
+        err = self._guard_message(user, target)
+        if err:
+            return err
+        content = (args.get("content") or "").strip()
+        if not content:
+            return "There's nothing to send."
+        kwargs = {}
+        if args.get("reply_to_message_id"):
+            try:
+                kwargs["reference"] = target.get_partial_message(int(args["reply_to_message_id"]))
+            except (ValueError, TypeError, AttributeError):
+                pass
+        message = await target.send(content[:1900], **kwargs)
+        log.info("AI: %s posted a message in #%s", user, target.name)
+        return f"Posted in #{target.name} (message id {message.id})."
+
+    async def _tool_send_embed(self, guild, channel, user, args) -> str:
+        target = self._target_channel(guild, channel, args)
+        err = self._guard_message(user, target)
+        if err:
+            return err
+        embed = discord.Embed()
+        if args.get("title"):
+            embed.title = str(args["title"])[:256]
+        if args.get("description"):
+            embed.description = str(args["description"])[:4000]
+        if args.get("colour"):
+            try:
+                embed.colour = discord.Colour.from_str(args["colour"])
+            except ValueError:
+                return f"'{args['colour']}' isn't a valid hex colour."
+        if args.get("footer"):
+            embed.set_footer(text=str(args["footer"])[:2048])
+        if args.get("image_url"):
+            embed.set_image(url=args["image_url"])
+        if args.get("thumbnail_url"):
+            embed.set_thumbnail(url=args["thumbnail_url"])
+        for field in (args.get("fields") or [])[:25]:
+            embed.add_field(
+                name=str(field.get("name", ""))[:256] or "\u200b",
+                value=str(field.get("value", ""))[:1024] or "\u200b",
+                inline=bool(field.get("inline", False)),
+            )
+        message = await target.send(embed=embed)
+        log.info("AI: %s posted an embed in #%s", user, target.name)
+        return f"Posted an embed in #{target.name} (message id {message.id})."
+
+    async def _tool_read_messages(self, guild, channel, user, args) -> str:
+        target = self._target_channel(guild, channel, args)
+        if not isinstance(target, (discord.TextChannel, discord.Thread)):
+            return "No matching text channel found."
+        limit = max(1, min(int(args.get("limit", 20)), 50))
+        messages = [m async for m in target.history(limit=limit)]
+        if not messages:
+            return "No messages."
+        lines = []
+        for message in reversed(messages):
+            content = (message.content or "").replace("\n", " ")[:120]
+            lines.append(f"- [{message.id}] {message.author}: {content}")
+        return "Recent messages (oldest first):\n" + "\n".join(lines)
+
+    async def _tool_edit_message(self, guild, channel, user, args) -> str:
+        target = self._target_channel(guild, channel, args)
+        err = self._guard_message(user, target)
+        if err:
+            return err
+        message = await self._fetch_message(target, args.get("message_id"))
+        if message is None:
+            return "I couldn't find that message."
+        if message.author.id != self.bot.user.id:
+            return "I can only edit my own messages."
+        await message.edit(content=(args.get("content") or "")[:1900])
+        return "Edited the message."
+
+    async def _tool_delete_message(self, guild, channel, user, args) -> str:
+        target = self._target_channel(guild, channel, args)
+        err = self._guard_message(user, target)
+        if err:
+            return err
+        message = await self._fetch_message(target, args.get("message_id"))
+        if message is None:
+            return "I couldn't find that message."
+        await message.delete()
+        return "Deleted the message."
+
+    async def _tool_pin_message(self, guild, channel, user, args) -> str:
+        target = self._target_channel(guild, channel, args)
+        err = self._guard_message(user, target)
+        if err:
+            return err
+        message = await self._fetch_message(target, args.get("message_id"))
+        if message is None:
+            return "I couldn't find that message."
+        await message.pin()
+        return "Pinned the message."
+
+    async def _tool_unpin_message(self, guild, channel, user, args) -> str:
+        target = self._target_channel(guild, channel, args)
+        err = self._guard_message(user, target)
+        if err:
+            return err
+        message = await self._fetch_message(target, args.get("message_id"))
+        if message is None:
+            return "I couldn't find that message."
+        await message.unpin()
+        return "Unpinned the message."
+
+    async def _tool_react_to_message(self, guild, channel, user, args) -> str:
+        target = self._target_channel(guild, channel, args)
+        err = self._guard_message(user, target)
+        if err:
+            return err
+        message = await self._fetch_message(target, args.get("message_id"))
+        if message is None:
+            return "I couldn't find that message."
+        emoji = (args.get("emoji") or "").strip()
+        if not emoji:
+            return "An emoji is required."
+        await message.add_reaction(emoji)
+        return f"Reacted with {emoji}."
+
+    async def _tool_dm_user(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_guild")
+        if err:
+            return err
+        member = self._resolve_member(guild, args.get("user", ""))
+        if member is None:
+            return "No matching member found."
+        content = (args.get("content") or "").strip()
+        if not content:
+            return "There's nothing to send."
+        try:
+            await member.send(content[:1900])
+        except discord.Forbidden:
+            return f"I couldn't DM {member} - they may have DMs closed."
+        log.info("AI: %s DMed %s", user, member)
+        return f"Sent a DM to {member}."
 
     # ------------------------------------------------------------------ commands
 
