@@ -299,10 +299,18 @@ ACTION_TOOLS = [
         {"name": _STR, "description": _STR, "tags": _STR_DESC("A unicode emoji or short text."),
          "image_url": _STR}, ["name", "description", "tags", "image_url"]),
     _fn("delete_sticker", "Delete a sticker by name.", {"sticker": _STR}, ["sticker"]),
-    _fn("set_welcome", "Set up automatic welcome messages for new members.",
+    _fn("set_welcome", "Set up automatic welcome messages. Options left out are unchanged.",
         {"channel": _STR,
-         "message": _STR_DESC("Template; supports {user}, {name}, {server}, {count}."),
-         "embed": {"type": "boolean"}, "enabled": {"type": "boolean"},
+         "message": _STR_DESC("Description template; supports {user}, {name}, {server}, {count}."),
+         "title": _STR_DESC("Title template, e.g. 'Welcome to {server}!'."),
+         "footer": _STR_DESC("Footer template, e.g. 'You are member #{count}'."),
+         "colour": _STR_DESC("Hex colour like #7C3AED, or 'brand' for the bot colour."),
+         "thumbnail": _STR_DESC("'avatar', 'none', or an image URL."),
+         "image": _STR_DESC("'avatar', 'none', or a banner image URL."),
+         "fields": {"type": "array", "items": {"type": "object",
+             "properties": {"name": _STR, "value": _STR, "inline": {"type": "boolean"}}}},
+         "embed": {"type": "boolean"}, "mention": {"type": "boolean"},
+         "enabled": {"type": "boolean"},
          "ai": {"type": "boolean", "description": "Write a personalised welcome with the AI."}},
         ["channel"]),
     _fn("disable_welcome", "Turn off automatic welcome messages."),
@@ -328,7 +336,7 @@ class DeepSeek(commands.Cog):
     """A DeepSeek assistant that can read and manage the server."""
 
     __author__ = ["Riley"]
-    __version__ = "1.5.0"
+    __version__ = "1.6.0"
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -344,6 +352,13 @@ class DeepSeek(commands.Cog):
             allow_actions=True,
             welcome_channel=None,
             welcome_message="Welcome {user} to **{server}**! Please read the rules and say hi.",
+            welcome_title="Welcome to {server}!",
+            welcome_footer="You are member #{count}",
+            welcome_colour=None,
+            welcome_thumbnail="avatar",
+            welcome_image=None,
+            welcome_mention=True,
+            welcome_fields=[],
             welcome_embed=True,
             welcome_enabled=False,
             welcome_ai=False,
@@ -1969,10 +1984,10 @@ class DeepSeek(commands.Cog):
     # ----------------------------------------------------------- welcome tools
 
     @staticmethod
-    def _render_template(template: str, member) -> str:
+    def _render_template(template: str, member, mention: bool = True) -> str:
         return (
             str(template)
-            .replace("{user}", member.mention)
+            .replace("{user}", member.mention if mention else member.display_name)
             .replace("{name}", member.display_name)
             .replace("{username}", member.name)
             .replace("{server}", member.guild.name)
@@ -2014,18 +2029,44 @@ class DeepSeek(commands.Cog):
             if generated:
                 text = generated
 
+        ping = await conf.welcome_mention()
         try:
-            if await conf.welcome_embed():
-                embed = discord.Embed(
-                    title=f"Welcome to {member.guild.name}!",
-                    description=text,
-                    colour=discord.Colour(await self.bot._config.color()),
+            if not await conf.welcome_embed():
+                await channel.send(f"{member.mention} {text}" if ping else text)
+                return True
+
+            title = self._render_template(await conf.welcome_title(), member, mention=False)
+            footer = self._render_template(await conf.welcome_footer(), member, mention=False)
+            colour_conf = await conf.welcome_colour()
+            try:
+                colour = (
+                    discord.Colour.from_str(colour_conf)
+                    if colour_conf
+                    else discord.Colour(await self.bot._config.color())
                 )
-                embed.set_thumbnail(url=member.display_avatar.url)
-                embed.set_footer(text=f"You are member #{member.guild.member_count}")
-                await channel.send(content=member.mention, embed=embed)
-            else:
-                await channel.send(f"{member.mention} {text}")
+            except ValueError:
+                colour = discord.Colour(await self.bot._config.color())
+
+            embed = discord.Embed(title=title[:256] or None, description=text[:4000], colour=colour)
+
+            thumbnail = await conf.welcome_thumbnail()
+            if thumbnail and thumbnail != "none":
+                embed.set_thumbnail(
+                    url=member.display_avatar.url if thumbnail == "avatar" else thumbnail
+                )
+            image = await conf.welcome_image()
+            if image and image != "none":
+                embed.set_image(url=member.display_avatar.url if image == "avatar" else image)
+            if footer:
+                embed.set_footer(text=footer[:2048])
+            for field in (await conf.welcome_fields())[:25]:
+                embed.add_field(
+                    name=str(field.get("name", ""))[:256] or "\u200b",
+                    value=str(field.get("value", ""))[:1024] or "\u200b",
+                    inline=bool(field.get("inline", False)),
+                )
+
+            await channel.send(content=member.mention if ping else None, embed=embed)
         except discord.HTTPException:
             log.warning("Welcome message failed in guild %s", member.guild.id)
             return False
@@ -2050,6 +2091,21 @@ class DeepSeek(commands.Cog):
         await conf.welcome_channel.set(target.id)
         if args.get("message") is not None:
             await conf.welcome_message.set(str(args["message"]))
+        if args.get("title") is not None:
+            await conf.welcome_title.set(str(args["title"]))
+        if args.get("footer") is not None:
+            await conf.welcome_footer.set(str(args["footer"]))
+        if args.get("colour") is not None:
+            value = str(args["colour"])
+            await conf.welcome_colour.set(None if value.lower() == "brand" else value)
+        if args.get("thumbnail") is not None:
+            await conf.welcome_thumbnail.set(str(args["thumbnail"]))
+        if args.get("image") is not None:
+            await conf.welcome_image.set(str(args["image"]))
+        if args.get("fields") is not None:
+            await conf.welcome_fields.set(list(args["fields"]))
+        if args.get("mention") is not None:
+            await conf.welcome_mention.set(bool(args["mention"]))
         if args.get("embed") is not None:
             await conf.welcome_embed.set(bool(args["embed"]))
         if args.get("ai") is not None:
@@ -2069,10 +2125,15 @@ class DeepSeek(commands.Cog):
     async def _tool_get_welcome(self, guild, channel, user, args) -> str:
         settings = await self.config.guild(guild).all()
         chan = f"<#{settings['welcome_channel']}>" if settings.get("welcome_channel") else "None"
+        fields = settings.get("welcome_fields") or []
         return (
             f"Enabled: {settings['welcome_enabled']}\nChannel: {chan}\n"
-            f"Embed: {settings['welcome_embed']}\nAI: {settings['welcome_ai']}\n"
-            f"Message: {settings['welcome_message']}"
+            f"Embed: {settings['welcome_embed']}  Mention: {settings['welcome_mention']}\n"
+            f"Title: {settings['welcome_title']}\nMessage: {settings['welcome_message']}\n"
+            f"Footer: {settings['welcome_footer']}\n"
+            f"Colour: {settings['welcome_colour'] or 'brand'}\n"
+            f"Thumbnail: {settings['welcome_thumbnail']}\nImage: {settings['welcome_image']}\n"
+            f"AI: {settings['welcome_ai']}  Extra fields: {len(fields)}"
         )
 
     async def _tool_test_welcome(self, guild, channel, user, args) -> str:
