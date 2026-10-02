@@ -357,6 +357,8 @@ ACTION_TOOLS = [
              "roles": {"type": "array", "items": {"type": "object", "properties": {
                  "emoji": _STR, "role": _STR}}}}}}},
         ["sections"]),
+    _fn("set_role_messages", "Customise the ephemeral text shown when someone gets/removes a role via a role menu ({role} is replaced by the role name).",
+        {"added": _STR, "removed": _STR}),
 ]
 
 
@@ -377,7 +379,7 @@ class DeepSeek(commands.Cog):
     """A DeepSeek assistant that can read and manage the server."""
 
     __author__ = ["Riley"]
-    __version__ = "1.9.0"
+    __version__ = "1.9.1"
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -406,6 +408,8 @@ class DeepSeek(commands.Cog):
             welcome_ai_mode="replace",
             react_roles={},
             vision=True,
+            role_add_msg="Gave you **{role}**.",
+            role_remove_msg="Removed **{role}**.",
         )
         self.session: Optional[aiohttp.ClientSession] = None
         self.api_key: Optional[str] = None
@@ -2380,7 +2384,10 @@ class DeepSeek(commands.Cog):
         try:
             if role in member.roles:
                 await member.remove_roles(role, reason="Role menu")
-                await interaction.response.send_message(f"Removed **{role.name}**.", ephemeral=True)
+                template = await self.config.guild(guild).role_remove_msg()
+                await interaction.response.send_message(
+                    template.replace("{role}", role.name), ephemeral=True
+                )
                 return
             group = mapping.get("group")
             if group:
@@ -2390,7 +2397,10 @@ class DeepSeek(commands.Cog):
                         if other_role and other_role in member.roles:
                             await member.remove_roles(other_role, reason="Role menu (exclusive)")
             await member.add_roles(role, reason="Role menu")
-            await interaction.response.send_message(f"Gave you **{role.name}**.", ephemeral=True)
+            template = await self.config.guild(guild).role_add_msg()
+            await interaction.response.send_message(
+                template.replace("{role}", role.name), ephemeral=True
+            )
         except discord.HTTPException:
             log.warning("Role menu update failed in guild %s", guild.id)
             try:
@@ -2408,6 +2418,22 @@ class DeepSeek(commands.Cog):
                 await self._handle_role_button(interaction, custom_id)
         except Exception:  # noqa: BLE001
             log.exception("Role-button handling failed")
+
+    async def _tool_set_role_messages(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_guild")
+        if err:
+            return err
+        conf = self.config.guild(guild)
+        changed = []
+        if args.get("added") is not None:
+            await conf.role_add_msg.set(str(args["added"]))
+            changed.append("added")
+        if args.get("removed") is not None:
+            await conf.role_remove_msg.set(str(args["removed"]))
+            changed.append("removed")
+        if not changed:
+            return "Nothing to change - give me an 'added' and/or 'removed' message."
+        return f"Updated the role-menu {', '.join(changed)} message."
 
     # ------------------------------------------------------------------ commands
 
