@@ -108,6 +108,10 @@ MAX_LIST_ITEMS = 60
 _PERM_FLAGS = getattr(discord.Permissions, "VALID_FLAGS", {})
 PERM_NAMES = set(_PERM_FLAGS)
 EXPRESSION_PERM = "manage_expressions" if "manage_expressions" in _PERM_FLAGS else "manage_emojis_and_stickers"
+# Matches a numbered or bulleted list line: "1. Title", "2) Title", "- Title", "**3. Title**".
+_ITEM_RE = re.compile(
+    r"^\s*(?:\*\*|__)?\s*(?:(?P<num>\d+)[.)]\s*|[-*•]\s+)(?P<title>.+?)(?:\*\*|__)?\s*$"
+)
 
 
 def _fn(name: str, description: str, properties: dict | None = None, required: list | None = None) -> dict:
@@ -1384,16 +1388,57 @@ class DeepSeek(commands.Cog):
         log.info("AI: %s posted a message in #%s", user, target.name)
         return f"Posted in #{target.name} (message id {message.id})."
 
+    @staticmethod
+    def _split_list(text: str):
+        """Split a list-like description into (preamble, [(num, title, body)]).
+
+        Used so a numbered/bulleted list is rendered as separate embed fields
+        regardless of how the model formatted its arguments.
+        """
+        preamble: list[str] = []
+        items: list[list] = []
+        current = None
+        for raw in text.splitlines():
+            line = raw.strip()
+            match = _ITEM_RE.match(line)
+            if match and len((match.group("title") or "").strip()) <= 100:
+                if current is not None:
+                    items.append(current)
+                title = match.group("title").strip().strip("*").strip()
+                current = [match.group("num"), title, []]
+            elif current is not None:
+                if line:
+                    current[2].append(line)
+            elif line:
+                preamble.append(line)
+        if current is not None:
+            items.append(current)
+        return "\n".join(preamble), [(num, title, " ".join(body)) for num, title, body in items]
+
     async def _tool_send_embed(self, guild, channel, user, args) -> str:
         target = self._target_channel(guild, channel, args)
         err = self._guard_message(user, target)
         if err:
             return err
+
+        description = (args.get("description") or "").strip() or None
+        fields = list(args.get("fields") or [])
+        auto_split = False
+        if not fields and description:
+            preamble, items = self._split_list(description)
+            if len(items) >= 3:
+                description = preamble or None
+                fields = [
+                    {"name": (f"{num}. {title}" if num else title), "value": body or "\u200b"}
+                    for num, title, body in items
+                ]
+                auto_split = True
+
         embed = discord.Embed()
         if args.get("title"):
             embed.title = str(args["title"])[:256]
-        if args.get("description"):
-            embed.description = str(args["description"])[:4000]
+        if description:
+            embed.description = description[:4000]
         if args.get("colour"):
             try:
                 embed.colour = discord.Colour.from_str(args["colour"])
@@ -1405,14 +1450,19 @@ class DeepSeek(commands.Cog):
             embed.set_image(url=args["image_url"])
         if args.get("thumbnail_url"):
             embed.set_thumbnail(url=args["thumbnail_url"])
-        for field in (args.get("fields") or [])[:25]:
+        for field in fields[:25]:
             embed.add_field(
                 name=str(field.get("name", ""))[:256] or "\u200b",
                 value=str(field.get("value", ""))[:1024] or "\u200b",
                 inline=bool(field.get("inline", False)),
             )
         message = await target.send(embed=embed)
-        log.info("AI: %s posted an embed in #%s", user, target.name)
+        log.info(
+            "AI: %s posted an embed in #%s%s",
+            user,
+            target.name,
+            " (auto-split into fields)" if auto_split else "",
+        )
         return f"Posted an embed in #{target.name} (message id {message.id})."
 
     async def _tool_read_messages(self, guild, channel, user, args) -> str:
