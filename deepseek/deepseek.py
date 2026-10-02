@@ -21,6 +21,7 @@ Models: ``deepseek-flash`` (fast) and ``deepseek-v4-pro`` (reasoning).
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
 import logging
@@ -376,7 +377,7 @@ class DeepSeek(commands.Cog):
     """A DeepSeek assistant that can read and manage the server."""
 
     __author__ = ["Riley"]
-    __version__ = "1.8.0"
+    __version__ = "1.9.0"
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -404,6 +405,7 @@ class DeepSeek(commands.Cog):
             welcome_ai=False,
             welcome_ai_mode="replace",
             react_roles={},
+            vision=True,
         )
         self.session: Optional[aiohttp.ClientSession] = None
         self.api_key: Optional[str] = None
@@ -713,7 +715,30 @@ class DeepSeek(commands.Cog):
         parts.append("Resolve words like 'me', 'my' and 'I' to this person.")
         return " ".join(parts)
 
-    async def _answer(self, guild, channel, user, prompt: str) -> str:
+    async def _encode_images(self, attachments) -> list:
+        """Fetch image attachments and return base64 data URLs for the model."""
+        urls = []
+        for attachment in attachments[:10]:
+            if not (attachment.content_type or "").startswith("image/"):
+                continue
+            if attachment.size and attachment.size > 20 * 1024 * 1024:
+                continue
+            try:
+                async with self.session.get(
+                    attachment.url, timeout=aiohttp.ClientTimeout(total=30)
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.read()
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                continue
+            encoded = base64.b64encode(data).decode("ascii")
+            urls.append(f"data:{attachment.content_type};base64,{encoded}")
+        return urls
+
+    async def _answer(
+        self, guild, channel, user, prompt: str, image_attachments=None
+    ) -> str:
         conf = self.config.guild(guild)
         system = await conf.system()
         max_history = await conf.max_history()
@@ -725,7 +750,16 @@ class DeepSeek(commands.Cog):
             {"role": "system", "content": f"{system}\n\n{self._requester_context(guild, channel, user)}"}
         ]
         messages.extend(history[-max_history:])
-        messages.append({"role": "user", "content": prompt})
+
+        images = []
+        if image_attachments and await conf.vision() and await conf.model() == "deepseek-flash":
+            images = await self._encode_images(image_attachments)
+        if images:
+            content: list = [{"type": "text", "text": prompt}]
+            content.extend({"type": "image_url", "image_url": {"url": url}} for url in images)
+            messages.append({"role": "user", "content": content})
+        else:
+            messages.append({"role": "user", "content": prompt})
 
         tools = list(READ_TOOLS)
         if allow_actions:
@@ -2388,9 +2422,14 @@ class DeepSeek(commands.Cog):
         prompt = prompt.strip()[:MAX_PROMPT_CHARS]
         if not prompt:
             return await ctx.send_help()
+        attachments = [
+            a for a in ctx.message.attachments if (a.content_type or "").startswith("image/")
+        ]
         try:
             async with ctx.typing():
-                text = await self._answer(ctx.guild, ctx.channel, ctx.author, prompt)
+                text = await self._answer(
+                    ctx.guild, ctx.channel, ctx.author, prompt, image_attachments=attachments
+                )
         except Exception:  # noqa: BLE001
             log.exception("DeepSeek command failed in guild %s", ctx.guild.id)
             text = "Something went wrong handling that request - check the bot logs."
@@ -2453,6 +2492,12 @@ class DeepSeek(commands.Cog):
         await self.config.guild(ctx.guild).allow_actions.set(enabled)
         await ctx.tick()
 
+    @aiset.command(name="vision")
+    async def aiset_vision(self, ctx: commands.Context, enabled: bool):
+        """Let the AI read image attachments (deepseek-flash only)."""
+        await self.config.guild(ctx.guild).vision.set(enabled)
+        await ctx.tick()
+
     @aiset.command(name="channel")
     async def aiset_channel(self, ctx: commands.Context, channel: discord.TextChannel = None):
         """Set an AI channel (no prefix needed), or omit the channel to clear it."""
@@ -2484,7 +2529,7 @@ class DeepSeek(commands.Cog):
         await ctx.send(
             f"Model: {settings['model']}\nHistory: {settings['max_history']} messages\n"
             f"Max tokens: {settings['max_tokens']}\nThinking: {settings['thinking']}\n"
-            f"Actions: {settings['allow_actions']}\nAI channel: {channel}\n"
+            f"Actions: {settings['allow_actions']}\nVision: {settings.get('vision', True)}\nAI channel: {channel}\n"
             f"Respond to mentions: {settings['respond_to_mentions']}\n"
             f"API key set: {'yes' if self.api_key else 'no'}"
         )
@@ -2536,9 +2581,25 @@ class DeepSeek(commands.Cog):
         if not self._cooldown_ok(message.author.id):
             return
 
+        attachments = [
+            a for a in message.attachments if (a.content_type or "").startswith("image/")
+        ]
+        if message.reference is not None:
+            resolved = message.reference.resolved
+            if isinstance(resolved, discord.Message):
+                attachments += [
+                    a for a in resolved.attachments if (a.content_type or "").startswith("image/")
+                ]
+
         try:
             async with message.channel.typing():
-                text = await self._answer(message.guild, message.channel, message.author, prompt)
+                text = await self._answer(
+                    message.guild,
+                    message.channel,
+                    message.author,
+                    prompt,
+                    image_attachments=attachments,
+                )
         except (discord.Forbidden, discord.HTTPException):
             return
         except Exception:  # noqa: BLE001 - never leave the user with no reply
