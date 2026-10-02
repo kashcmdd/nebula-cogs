@@ -21,11 +21,12 @@ Models: ``deepseek-flash`` (fast) and ``deepseek-v4-pro`` (reasoning).
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import re
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import aiohttp
@@ -49,7 +50,9 @@ DEFAULT_SYSTEM = (
     "channel topics, slowmode, locks and per-role/member permissions; post "
     "messages and embeds; read, edit, pin, react to and delete messages; change "
     "server settings; assign and remove roles; kick, ban, unban, timeout and "
-    "rename members; purge messages; send DMs; and create invites.\n"
+    "rename members; purge messages; send DMs; create invites and scheduled "
+    "events; moderate voice; manage AutoMod rules; reorder roles and channels; "
+    "update server settings; and manage stickers.\n"
     "Act immediately without asking for confirmation - including for purges "
     "and deletions. The ONLY action that needs confirmation is banning a "
     "member: before banning, ask the user to confirm, and only call ban_member "
@@ -103,6 +106,8 @@ READ_TOOLS = [
         {"limit": {"type": "integer", "description": "1-50, default 20."}}),
     _fn("read_messages", "Read recent messages in a channel (ids, authors, content).",
         {"channel": _STR, "limit": {"type": "integer", "description": "1-50, default 20."}}),
+    _fn("list_scheduled_events", "List scheduled events."),
+    _fn("list_automod_rules", "List AutoMod rules."),
 ]
 
 ACTION_TOOLS = [
@@ -170,7 +175,13 @@ ACTION_TOOLS = [
          "verification_level": {"type": "string", "enum": ["none", "low", "medium", "high", "highest"]},
          "explicit_content_filter": {"type": "string", "enum": ["disabled", "no_role", "all_members"]},
          "default_notifications": {"type": "string", "enum": ["all_messages", "only_mentions"]},
-         "system_channel": _STR}),
+         "system_channel": _STR, "afk_channel": _STR,
+         "afk_timeout_seconds": {"type": "integer"},
+         "require_2fa": {"type": "boolean"},
+         "suppress_join_notifications": {"type": "boolean"},
+         "suppress_boost_notifications": {"type": "boolean"},
+         "rules_channel": _STR, "public_updates_channel": _STR,
+         "vanity_code": _STR_DESC("Requires boost level 3 and your permission.")}),
     _fn("set_server_icon", "Set the server icon from an image URL.", {"image_url": _STR}, ["image_url"]),
     _fn("send_message", "Post a message in a channel.",
         {"channel": _STR, "content": _STR, "reply_to_message_id": _STR}, ["content"]),
@@ -188,6 +199,45 @@ ACTION_TOOLS = [
     _fn("react_to_message", "Add a reaction to a message by id.",
         {"channel": _STR, "message_id": _STR, "emoji": _STR}, ["message_id", "emoji"]),
     _fn("dm_user", "Send a direct message to a member.", {"user": _STR, "content": _STR}, ["user", "content"]),
+    _fn("voice_move", "Move a member to a voice channel, or disconnect them with channel='disconnect'.",
+        {"member": _STR, "channel": _STR}, ["member", "channel"]),
+    _fn("voice_mute", "Server-mute or unmute a member.",
+        {"member": _STR, "mute": {"type": "boolean"}}, ["member", "mute"]),
+    _fn("voice_deafen", "Server-deafen or undeafen a member.",
+        {"member": _STR, "deafen": {"type": "boolean"}}, ["member", "deafen"]),
+    _fn("create_scheduled_event", "Create a scheduled event.",
+        {"name": _STR, "start_time": _STR_DESC("ISO like 2026-10-02T18:00 or 'in 2h'."),
+         "entity_type": {"type": "string", "enum": ["voice", "stage", "external"]},
+         "channel": _STR, "location": _STR_DESC("Required for external events."),
+         "description": _STR, "end_time": _STR},
+        ["name", "start_time"]),
+    _fn("edit_scheduled_event", "Edit a scheduled event.",
+        {"event": _STR, "name": _STR, "description": _STR, "start_time": _STR, "end_time": _STR}, ["event"]),
+    _fn("delete_scheduled_event", "Delete a scheduled event.", {"event": _STR}, ["event"]),
+    _fn("create_automod_rule", "Create an AutoMod rule.",
+        {"name": _STR,
+         "trigger_type": {"type": "string", "enum": ["keyword", "keyword_preset", "mention_spam", "spam"]},
+         "keywords": {"type": "array", "items": _STR},
+         "presets": {"type": "array", "items": _STR, "description": "e.g. profanity, sexual_content, slurs."},
+         "mention_limit": {"type": "integer"},
+         "block_message": {"type": "boolean"},
+         "timeout_seconds": {"type": "integer"},
+         "alert_channel": _STR},
+        ["name", "trigger_type"]),
+    _fn("delete_automod_rule", "Delete an AutoMod rule by name or id.", {"rule": _STR}, ["rule"]),
+    _fn("move_role", "Move a role to a position (higher = more powerful).",
+        {"role": _STR, "position": {"type": "integer"}}, ["role", "position"]),
+    _fn("move_channel", "Move a channel into a category or to a position.",
+        {"channel": _STR, "category": _STR_DESC("Category name, or 'none' to remove it from its category."),
+         "position": {"type": "integer"}}, ["channel"]),
+    _fn("set_server_banner", "Set the server banner from an image URL (needs boost level 2).",
+        {"image_url": _STR}, ["image_url"]),
+    _fn("prune_members", "Kick members inactive for the given number of days (1-30).",
+        {"days": {"type": "integer"}, "reason": _STR}, ["days"]),
+    _fn("create_sticker", "Create a sticker from a PNG image URL (320x320, needs sticker slots).",
+        {"name": _STR, "description": _STR, "tags": _STR_DESC("A unicode emoji or short text."),
+         "image_url": _STR}, ["name", "description", "tags", "image_url"]),
+    _fn("delete_sticker", "Delete a sticker by name.", {"sticker": _STR}, ["sticker"]),
 ]
 
 
@@ -208,7 +258,7 @@ class DeepSeek(commands.Cog):
     """A DeepSeek assistant that can read and manage the server."""
 
     __author__ = ["Riley"]
-    __version__ = "1.3.0"
+    __version__ = "1.4.0"
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -283,6 +333,47 @@ class DeepSeek(commands.Cog):
             return await channel.fetch_message(int(message_id))
         except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError, TypeError):
             return None
+
+    @staticmethod
+    def _parse_time(text):
+        if not text:
+            return None
+        text = str(text).strip()
+        relative = re.fullmatch(r"in\s+(.+)", text, re.IGNORECASE)
+        if relative:
+            seconds = DeepSeek._parse_duration(relative.group(1))
+            return discord.utils.utcnow() + timedelta(seconds=seconds) if seconds else None
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+    @staticmethod
+    def _resolve_event(guild, text):
+        text = (text or "").strip()
+        if text.isdigit():
+            return guild.get_scheduled_event(int(text))
+        events = guild.scheduled_events
+        for event in events:
+            if event.name.lower() == text.lower():
+                return event
+        for event in events:
+            if text and text.lower() in event.name.lower():
+                return event
+        return None
+
+    async def _resolve_automod_rule(self, guild, text):
+        text = (text or "").strip()
+        if text.isdigit():
+            try:
+                return await guild.fetch_automod_rule(int(text))
+            except discord.NotFound:
+                return None
+        for rule in await guild.fetch_automod_rules():
+            if rule.name.lower() == text.lower():
+                return rule
+        return None
 
     def _can_manage_roles(self, user, guild) -> bool:
         if user.id in self.bot.owner_ids or guild.owner_id == user.id:
@@ -1098,6 +1189,40 @@ class DeepSeek(commands.Cog):
             if not isinstance(system, discord.TextChannel):
                 return "No matching system channel found."
             kwargs["system_channel"] = system
+        if args.get("afk_channel"):
+            afk = self._resolve_channel(guild, args["afk_channel"])
+            if not isinstance(afk, discord.VoiceChannel):
+                return "No matching AFK voice channel found."
+            kwargs["afk_channel"] = afk
+        if args.get("afk_timeout_seconds") is not None:
+            kwargs["afk_timeout"] = int(args["afk_timeout_seconds"])
+        if args.get("require_2fa") is not None:
+            kwargs["mfa_level"] = (
+                discord.MFALevel.require_2fa if args["require_2fa"] else discord.MFALevel.disabled
+            )
+        if args.get("vanity_code"):
+            kwargs["vanity_code"] = args["vanity_code"]
+        if args.get("rules_channel"):
+            rules = self._resolve_channel(guild, args["rules_channel"])
+            if isinstance(rules, discord.TextChannel):
+                kwargs["rules_channel"] = rules
+        if args.get("public_updates_channel"):
+            updates = self._resolve_channel(guild, args["public_updates_channel"])
+            if isinstance(updates, discord.TextChannel):
+                kwargs["public_updates_channel"] = updates
+        if (
+            args.get("suppress_join_notifications") is not None
+            or args.get("suppress_boost_notifications") is not None
+        ):
+            flags = guild.system_channel_flags
+            kwargs["system_channel_flags"] = discord.SystemChannelFlags(
+                suppress_join_notifications=bool(
+                    args.get("suppress_join_notifications", flags.suppress_join_notifications)
+                ),
+                suppress_premium_subscriptions=bool(
+                    args.get("suppress_boost_notifications", flags.suppress_premium_subscriptions)
+                ),
+            )
         if not kwargs:
             return "Nothing to change."
         await guild.edit(reason=f"AI request by {user} ({user.id})", **kwargs)
@@ -1310,6 +1435,354 @@ class DeepSeek(commands.Cog):
             return f"I couldn't DM {member} - they may have DMs closed."
         log.info("AI: %s DMed %s", user, member)
         return f"Sent a DM to {member}."
+
+    # ---------------------------------------------------------- voice tools
+
+    async def _tool_voice_move(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "move_members")
+        if err:
+            return err
+        member = self._resolve_member(guild, args.get("member", ""))
+        if member is None:
+            return "No matching member found."
+        raw = (args.get("channel") or "").strip()
+        if raw.lower() in ("disconnect", "none", "off", ""):
+            if member.voice is None:
+                return f"{member} isn't in a voice channel."
+            await member.move_to(None, reason=f"AI request by {user} ({user.id})")
+            return f"Disconnected {member} from voice."
+        target = self._resolve_channel(guild, raw)
+        if not isinstance(target, (discord.VoiceChannel, discord.StageChannel)):
+            return "No matching voice channel found."
+        await member.move_to(target, reason=f"AI request by {user} ({user.id})")
+        log.info("AI: %s moved %s to voice channel %s", user, member, target.name)
+        return f"Moved {member} to {target.name}."
+
+    async def _tool_voice_mute(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "mute_members")
+        if err:
+            return err
+        member = self._resolve_member(guild, args.get("member", ""))
+        if member is None:
+            return "No matching member found."
+        if member.voice is None:
+            return f"{member} isn't in a voice channel."
+        muted = bool(args.get("mute"))
+        await member.edit(mute=muted, reason=f"AI request by {user} ({user.id})")
+        return f"{'Server-muted' if muted else 'Unmuted'} {member}."
+
+    async def _tool_voice_deafen(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "deafen_members")
+        if err:
+            return err
+        member = self._resolve_member(guild, args.get("member", ""))
+        if member is None:
+            return "No matching member found."
+        if member.voice is None:
+            return f"{member} isn't in a voice channel."
+        deafened = bool(args.get("deafen"))
+        await member.edit(deafen=deafened, reason=f"AI request by {user} ({user.id})")
+        return f"{'Server-deafened' if deafened else 'Undeafened'} {member}."
+
+    # --------------------------------------------------- scheduled event tools
+
+    async def _tool_create_scheduled_event(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_events")
+        if err:
+            return err
+        name = (args.get("name") or "").strip()
+        if not name:
+            return "A name is required."
+        start = self._parse_time(args.get("start_time"))
+        if start is None:
+            return "Give a start time like '2026-10-02T18:00' or 'in 2h'."
+        entity = (args.get("entity_type") or "voice").lower()
+        kwargs = {
+            "name": name,
+            "start_time": start,
+            "description": args.get("description") or None,
+            "reason": f"AI request by {user} ({user.id})",
+        }
+        if args.get("end_time"):
+            end = self._parse_time(args["end_time"])
+            if end:
+                kwargs["end_time"] = end
+        if entity == "external":
+            kwargs["entity_type"] = discord.EntityType.external
+            kwargs["location"] = args.get("location") or "Discord"
+        elif entity == "stage":
+            stage = self._resolve_channel(guild, args.get("channel", ""))
+            if not isinstance(stage, discord.StageChannel):
+                return "No matching stage channel."
+            kwargs["entity_type"] = discord.EntityType.stage_instance
+            kwargs["channel"] = stage
+        else:
+            voice = self._resolve_channel(guild, args.get("channel", ""))
+            if not isinstance(voice, discord.VoiceChannel):
+                return "No matching voice channel."
+            kwargs["entity_type"] = discord.EntityType.voice
+            kwargs["channel"] = voice
+        event = await guild.create_scheduled_event(**kwargs)
+        log.info("AI: %s created scheduled event '%s'", user, event.name)
+        return f"Created event '{event.name}' (id {event.id}) at {event.start_time:%Y-%m-%d %H:%M} UTC."
+
+    async def _tool_edit_scheduled_event(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_events")
+        if err:
+            return err
+        event = self._resolve_event(guild, args.get("event", ""))
+        if event is None:
+            return "No matching scheduled event."
+        kwargs = {}
+        if args.get("name"):
+            kwargs["name"] = args["name"]
+        if args.get("description"):
+            kwargs["description"] = args["description"]
+        if args.get("start_time"):
+            start = self._parse_time(args["start_time"])
+            if start:
+                kwargs["start_time"] = start
+        if args.get("end_time"):
+            end = self._parse_time(args["end_time"])
+            if end:
+                kwargs["end_time"] = end
+        if not kwargs:
+            return "Nothing to change."
+        await event.edit(**kwargs)
+        return f"Updated event '{event.name}'."
+
+    async def _tool_delete_scheduled_event(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_events")
+        if err:
+            return err
+        event = self._resolve_event(guild, args.get("event", ""))
+        if event is None:
+            return "No matching scheduled event."
+        name = event.name
+        await event.delete()
+        log.info("AI: %s deleted scheduled event '%s'", user, name)
+        return f"Deleted event '{name}'."
+
+    # ------------------------------------------------------- automod tools
+
+    async def _tool_create_automod_rule(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_guild")
+        if err:
+            return err
+        name = (args.get("name") or "").strip()
+        if not name:
+            return "A name is required."
+        actions = []
+        if args.get("block_message", True):
+            actions.append(discord.AutoModRuleAction(type=discord.AutoModRuleActionType.block_message))
+        if args.get("alert_channel"):
+            alert = self._resolve_channel(guild, args["alert_channel"])
+            if isinstance(alert, discord.TextChannel):
+                actions.append(
+                    discord.AutoModRuleAction(
+                        type=discord.AutoModRuleActionType.send_alert_message, channel_id=alert.id
+                    )
+                )
+        if args.get("timeout_seconds"):
+            seconds = self._parse_duration(args["timeout_seconds"])
+            if seconds:
+                actions.append(
+                    discord.AutoModRuleAction(
+                        type=discord.AutoModRuleActionType.timeout, duration=timedelta(seconds=seconds)
+                    )
+                )
+        if not actions:
+            actions.append(discord.AutoModRuleAction(type=discord.AutoModRuleActionType.block_message))
+
+        trigger_type = (args.get("trigger_type") or "").lower()
+        if trigger_type == "keyword":
+            keywords = args.get("keywords") or []
+            if not keywords:
+                return "Provide at least one keyword."
+            trigger = discord.AutoModTrigger(
+                type=discord.AutoModRuleTriggerType.keyword, keyword_filter=list(keywords)
+            )
+        elif trigger_type == "keyword_preset":
+            presets = [str(p).upper() for p in (args.get("presets") or [])]
+            if not presets:
+                return "Provide presets, e.g. profanity, sexual_content, slurs."
+            trigger = discord.AutoModTrigger(
+                type=discord.AutoModRuleTriggerType.keyword_preset, presets=presets
+            )
+        elif trigger_type == "mention_spam":
+            trigger = discord.AutoModTrigger(
+                type=discord.AutoModRuleTriggerType.mention_spam,
+                mention_limit=max(1, int(args.get("mention_limit") or 5)),
+            )
+        elif trigger_type == "spam":
+            trigger = discord.AutoModTrigger(type=discord.AutoModRuleTriggerType.spam)
+        else:
+            return "trigger_type must be keyword, keyword_preset, mention_spam or spam."
+
+        rule = await guild.create_automod_rule(
+            name=name,
+            event_type=discord.AutoModRuleEventType.message_send,
+            trigger=trigger,
+            actions=actions,
+            reason=f"AI request by {user} ({user.id})",
+        )
+        log.info("AI: %s created automod rule '%s'", user, rule.name)
+        return f"Created AutoMod rule '{rule.name}' (id {rule.id})."
+
+    async def _tool_delete_automod_rule(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_guild")
+        if err:
+            return err
+        rule = await self._resolve_automod_rule(guild, args.get("rule", ""))
+        if rule is None:
+            return "No matching AutoMod rule."
+        name = rule.name
+        await rule.delete()
+        log.info("AI: %s deleted automod rule '%s'", user, name)
+        return f"Deleted AutoMod rule '{name}'."
+
+    async def _tool_list_automod_rules(self, guild, channel, user, args) -> str:
+        rules = await guild.fetch_automod_rules()
+        if not rules:
+            return "No AutoMod rules."
+        lines = [
+            f"- {r.name} (id {r.id}) trigger={r.trigger.type.name}, enabled={r.enabled}" for r in rules
+        ]
+        return "AutoMod rules:\n" + "\n".join(lines)
+
+    # --------------------------------------------------------- reorder tools
+
+    async def _tool_move_role(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_roles")
+        if err:
+            return err
+        role = self._resolve_role(guild, args.get("role", ""))
+        if role is None or role.is_default():
+            return "No movable role matched that name."
+        max_position = guild.me.top_role.position - 1
+        if user.id != guild.owner_id:
+            max_position = min(
+                max_position, getattr(user, "top_role", guild.me.top_role).position - 1
+            )
+        position = max(1, min(int(args.get("position", 1)), max_position))
+        await role.edit(position=position, reason=f"AI request by {user} ({user.id})")
+        log.info("AI: %s moved role '%s' to %d", user, role.name, role.position)
+        return f"Moved '{role.name}' to position {role.position}."
+
+    async def _tool_move_channel(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_channels")
+        if err:
+            return err
+        target = self._resolve_channel(guild, args.get("channel", ""))
+        if not isinstance(target, discord.abc.GuildChannel):
+            return "No matching channel found."
+        kwargs = {}
+        raw_category = args.get("category")
+        if raw_category:
+            if str(raw_category).lower() in ("none", "top", "no category"):
+                kwargs["category"] = None
+            else:
+                category = self._resolve_channel(guild, raw_category)
+                if not isinstance(category, discord.CategoryChannel):
+                    return "No matching category."
+                kwargs["category"] = category
+        if args.get("position") is not None:
+            kwargs["position"] = int(args["position"])
+        if not kwargs:
+            return "Give a category or a position."
+        await target.edit(reason=f"AI request by {user} ({user.id})", **kwargs)
+        return f"Moved '{target.name}'."
+
+    # ------------------------------------------------ banner / prune / stickers
+
+    async def _tool_set_server_banner(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "manage_guild")
+        if err:
+            return err
+        url = (args.get("image_url") or "").strip()
+        if not url:
+            return "An image URL is required."
+        async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            if resp.status != 200:
+                return "Couldn't download that image."
+            data = await resp.read()
+        if len(data) > 10 * 1024 * 1024:
+            return "That image is too large."
+        try:
+            await guild.edit(banner=data, reason=f"AI request by {user} ({user.id})")
+        except discord.HTTPException as exc:
+            return f"Discord refused the banner (needs boost level 2): {exc}"
+        return "Updated the server banner."
+
+    async def _tool_prune_members(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, "kick_members")
+        if err:
+            return err
+        days = max(1, min(int(args.get("days", 7)), 30))
+        try:
+            count = await guild.prune_members(
+                days=days,
+                compute_prune_count=True,
+                reason=args.get("reason") or f"AI request by {user} ({user.id})",
+            )
+        except discord.Forbidden:
+            return "I don't have permission to prune members."
+        log.info("AI: %s pruned members inactive %d+ days", user, days)
+        return f"Pruned {count} member(s) inactive for {days}+ days."
+
+    async def _tool_create_sticker(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, EXPRESSION_PERM)
+        if err:
+            return err
+        name = (args.get("name") or "").strip()
+        description = (args.get("description") or "").strip()
+        tags = (args.get("tags") or "").strip()
+        url = (args.get("image_url") or "").strip()
+        if not all([name, description, tags, url]):
+            return "name, description, tags and image_url are all required."
+        async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            if resp.status != 200:
+                return "Couldn't download that image."
+            data = await resp.read()
+        if len(data) > 512 * 1024:
+            return "That image is larger than 512 KB."
+        file = discord.File(io.BytesIO(data), filename="sticker.png")
+        try:
+            sticker = await guild.create_sticker(
+                name=name,
+                description=description,
+                emoji=tags,
+                file=file,
+                reason=f"AI request by {user} ({user.id})",
+            )
+        except discord.HTTPException as exc:
+            return f"Discord refused the sticker (needs sticker slots / 320x320 PNG): {exc}"
+        log.info("AI: %s created sticker '%s'", user, sticker.name)
+        return f"Created sticker '{sticker.name}'."
+
+    async def _tool_delete_sticker(self, guild, channel, user, args) -> str:
+        err = self._guard(user, guild, EXPRESSION_PERM)
+        if err:
+            return err
+        name = (args.get("sticker") or "").strip()
+        sticker = discord.utils.get(guild.stickers, name=name)
+        if sticker is None:
+            sticker = discord.utils.get(await guild.fetch_stickers(), name=name)
+        if sticker is None:
+            return "No matching sticker found."
+        await guild.delete_sticker(sticker)
+        return f"Deleted sticker '{name}'."
+
+    async def _tool_list_scheduled_events(self, guild, channel, user, args) -> str:
+        events = guild.scheduled_events
+        if not events:
+            return "No scheduled events."
+        lines = []
+        for event in events:
+            when = event.start_time.strftime("%Y-%m-%d %H:%M") if event.start_time else "?"
+            where = getattr(event.channel, "name", None) or (event.location or "")
+            lines.append(f"- {event.name} (id {event.id}) {event.status.name}, starts {when} UTC, {where}")
+        return "Scheduled events:\n" + "\n".join(lines)
 
     # ------------------------------------------------------------------ commands
 

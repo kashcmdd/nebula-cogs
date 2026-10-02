@@ -62,26 +62,33 @@ to set by editing this cog's `DEFAULT_SYSTEM` and restarting).
 
 ### Server tools
 
-**Read (11):** `server_info`, `list_roles`, `list_channels`, `member_info`,
+**Read (13):** `server_info`, `list_roles`, `list_channels`, `member_info`,
 `list_bans`, `list_invites`, `list_emojis`, `list_stickers`, `list_webhooks`,
-`read_audit_log`, `read_messages`.
+`read_audit_log`, `read_messages`, `list_scheduled_events`,
+`list_automod_rules`.
 
-**Act (39):**
-- **Roles:** `add_role`, `remove_role`, `create_role`, `edit_role`, `delete_role`
-- **Channels:** `create_text_channel`, `create_voice_channel`, `create_category`,
-  `delete_channel`, `rename_channel`, `set_channel_topic`, `set_slowmode`,
-  `set_channel_lock`
+**Act (53):**
+- **Roles:** `add_role`, `remove_role`, `create_role`, `edit_role`,
+  `delete_role`, `move_role`
+- **Channels:** `create_text_channel`, `create_voice_channel`,
+  `create_category`, `delete_channel`, `rename_channel`, `set_channel_topic`,
+  `set_slowmode`, `set_channel_lock`, `move_channel`
 - **Permissions:** `set_channel_permission`, `clear_channel_permission`
 - **Threads:** `create_thread`, `delete_thread`
 - **Members:** `kick_member`, `ban_member`, `unban_member`, `timeout_member`,
-  `remove_timeout`, `set_nickname`
+  `remove_timeout`, `set_nickname`, `prune_members`
+- **Voice:** `voice_move`, `voice_mute`, `voice_deafen`
 - **Messages:** `send_message`, `send_embed`, `edit_message`, `delete_message`,
   `pin_message`, `unpin_message`, `react_to_message`, `purge_messages`
 - **DMs:** `dm_user`
 - **Invites:** `create_invite`
 - **Webhooks:** `create_webhook`, `delete_webhook`
-- **Emojis:** `create_emoji`, `delete_emoji`
-- **Server:** `edit_server`, `set_server_icon`
+- **Emojis/stickers:** `create_emoji`, `delete_emoji`, `create_sticker`,
+  `delete_sticker`
+- **Scheduled events:** `create_scheduled_event`, `edit_scheduled_event`,
+  `delete_scheduled_event`
+- **AutoMod:** `create_automod_rule`, `delete_automod_rule`
+- **Server:** `edit_server`, `set_server_icon`, `set_server_banner`
 
 Every action is checked against the **requester's** Discord permission at
 execution time — never the bot's — plus role-hierarchy rules, and is logged. The
