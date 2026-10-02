@@ -311,7 +311,9 @@ ACTION_TOOLS = [
              "properties": {"name": _STR, "value": _STR, "inline": {"type": "boolean"}}}},
          "embed": {"type": "boolean"}, "mention": {"type": "boolean"},
          "enabled": {"type": "boolean"},
-         "ai": {"type": "boolean", "description": "Write a personalised welcome with the AI."}},
+         "ai": {"type": "boolean", "description": "Write a personalised welcome with the AI."},
+         "ai_mode": {"type": "string", "enum": ["replace", "append"],
+                     "description": "replace = AI text only; append = keep the template and add the AI line."}},
         ["channel"]),
     _fn("disable_welcome", "Turn off automatic welcome messages."),
     _fn("get_welcome", "Show the current welcome-message settings."),
@@ -362,6 +364,7 @@ class DeepSeek(commands.Cog):
             welcome_embed=True,
             welcome_enabled=False,
             welcome_ai=False,
+            welcome_ai_mode="replace",
         )
         self.session: Optional[aiohttp.ClientSession] = None
         self.api_key: Optional[str] = None
@@ -1995,17 +1998,26 @@ class DeepSeek(commands.Cog):
         )
 
     async def _generate_welcome(self, member) -> Optional[str]:
+        template = await self.config.guild(member.guild).welcome_message()
+        style = self._render_template(template, member, mention=False)
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "You write ONE short, warm welcome message (max 2 sentences) for a new "
-                    "Discord member. Plain text, no headings, no emoji spam."
+                    "You write the welcome message shown in Discord when someone joins a server. "
+                    "Write 2-3 short, warm sentences addressed to the new member by name. "
+                    "Encourage them to read the rules, pick roles, and introduce themselves. "
+                    "Use at most one tasteful emoji. Plain text only - no headings, no lists, "
+                    "no quotation marks, do not repeat the server name more than once."
                 ),
             },
             {
                 "role": "user",
-                "content": f"Welcome {member.display_name} to the server '{member.guild.name}'.",
+                "content": (
+                    f"Server: {member.guild.name}\n"
+                    f"New member: {member.display_name}\n"
+                    f"Match this tone: {style}"
+                ),
             },
         ]
         try:
@@ -2027,7 +2039,10 @@ class DeepSeek(commands.Cog):
         if await conf.welcome_ai() and self.api_key:
             generated = await self._generate_welcome(member)
             if generated:
-                text = generated
+                if await conf.welcome_ai_mode() == "append":
+                    text = f"{text}\n\n{generated}"
+                else:
+                    text = generated
 
         ping = await conf.welcome_mention()
         try:
@@ -2110,6 +2125,9 @@ class DeepSeek(commands.Cog):
             await conf.welcome_embed.set(bool(args["embed"]))
         if args.get("ai") is not None:
             await conf.welcome_ai.set(bool(args["ai"]))
+        if args.get("ai_mode") is not None:
+            mode = str(args["ai_mode"]).lower()
+            await conf.welcome_ai_mode.set(mode if mode in ("replace", "append") else "replace")
         await conf.welcome_enabled.set(bool(args.get("enabled", True)))
         if await conf.welcome_ai() and not self.api_key:
             return f"Welcome enabled in #{target.name}, but AI needs an API key (`!set api deepseek api_key`)."
@@ -2133,7 +2151,7 @@ class DeepSeek(commands.Cog):
             f"Footer: {settings['welcome_footer']}\n"
             f"Colour: {settings['welcome_colour'] or 'brand'}\n"
             f"Thumbnail: {settings['welcome_thumbnail']}\nImage: {settings['welcome_image']}\n"
-            f"AI: {settings['welcome_ai']}  Extra fields: {len(fields)}"
+            f"AI: {settings['welcome_ai']} ({settings.get('welcome_ai_mode', 'replace')})  Extra fields: {len(fields)}"
         )
 
     async def _tool_test_welcome(self, guild, channel, user, args) -> str:
