@@ -84,6 +84,10 @@ DEFAULT_SYSTEM = (
     "events; moderate voice; manage AutoMod rules; reorder roles and channels; "
     "update server settings; and manage stickers. You can also set up automatic "
     "welcome messages for new members with set_welcome.\n"
+    "For embeds with several sections (menus, role lists, rules), use "
+    "send_sections; for self-assignable role menus use post_role_menu, which "
+    "adds the reactions and makes them actually grant/remove roles. Never claim "
+    "reactions assign roles unless you used post_role_menu.\n"
     "Act immediately without asking for confirmation - including for purges "
     "and deletions. The ONLY action that needs confirmation is banning a "
     "member: before banning, ask the user to confirm, and only call ban_member "
@@ -330,6 +334,20 @@ ACTION_TOOLS = [
     _fn("disable_welcome", "Turn off automatic welcome messages."),
     _fn("get_welcome", "Show the current welcome-message settings."),
     _fn("test_welcome", "Post a sample welcome to the configured channel."),
+    _fn("send_sections", "Post a clean embed with one field per section. Best for menus, lists and rules.",
+        {"channel": _STR, "title": _STR, "intro": _STR, "footer": _STR, "colour": _STR,
+         "sections": {"type": "array", "items": {"type": "object", "properties": {
+             "heading": _STR, "items": {"type": "array", "items": _STR}}}}},
+        ["sections"]),
+    _fn("post_role_menu", "Post a WORKING reaction-role menu: users react to get/remove a role.",
+        {"channel": _STR, "title": _STR, "intro": _STR, "footer": _STR,
+         "sections": {"type": "array", "items": {"type": "object", "properties": {
+             "heading": _STR,
+             "exclusive": {"type": "boolean",
+                           "description": "true = picking one role removes the others in this section."},
+             "roles": {"type": "array", "items": {"type": "object", "properties": {
+                 "emoji": _STR, "role": _STR}}}}}}},
+        ["sections"]),
 ]
 
 
@@ -350,7 +368,7 @@ class DeepSeek(commands.Cog):
     """A DeepSeek assistant that can read and manage the server."""
 
     __author__ = ["Riley"]
-    __version__ = "1.6.1"
+    __version__ = "1.7.0"
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -377,6 +395,7 @@ class DeepSeek(commands.Cog):
             welcome_enabled=False,
             welcome_ai=False,
             welcome_ai_mode="replace",
+            react_roles={},
         )
         self.session: Optional[aiohttp.ClientSession] = None
         self.api_key: Optional[str] = None
@@ -1608,6 +1627,8 @@ class DeepSeek(commands.Cog):
         if message is None:
             return "I couldn't find that message."
         await message.delete()
+        async with self.config.guild(guild).react_roles() as data:
+            data.pop(str(message.id), None)
         return "Deleted the message."
 
     async def _tool_pin_message(self, guild, channel, user, args) -> str:
@@ -2187,6 +2208,139 @@ class DeepSeek(commands.Cog):
             return err
         sent = await self._send_welcome(user)
         return "Sent a sample welcome." if sent else "No welcome channel configured, or welcomes are disabled."
+
+    # ---------------------------------------------------- clean / role menus
+
+    async def _tool_send_sections(self, guild, channel, user, args) -> str:
+        target = self._target_channel(guild, channel, args)
+        err = self._guard_message(user, target)
+        if err:
+            return err
+        sections = args.get("sections") or []
+        if not sections:
+            return "Provide at least one section."
+        embed = discord.Embed(colour=discord.Colour(await self.bot._config.color()))
+        if args.get("title"):
+            embed.title = str(args["title"])[:256]
+        if args.get("intro"):
+            embed.description = str(args["intro"])[:4000]
+        if args.get("footer"):
+            embed.set_footer(text=str(args["footer"])[:2048])
+        for section in sections[:10]:
+            heading = str(section.get("heading") or "Section")[:256]
+            items = section.get("items") or []
+            value = "\n".join(str(item) for item in items)[:1024] or "\u200b"
+            embed.add_field(
+                name=heading or "\u200b", value=value, inline=bool(section.get("inline", False))
+            )
+        message = await target.send(embed=embed)
+        log.info("AI: %s posted a sectioned embed in #%s", user, target.name)
+        return f"Posted a sectioned embed in #{target.name} (message id {message.id})."
+
+    async def _tool_post_role_menu(self, guild, channel, user, args) -> str:
+        target = self._target_channel(guild, channel, args)
+        err = self._guard_message(user, target)
+        if err:
+            return err
+        err = self._guard(user, guild, "manage_roles")
+        if err:
+            return err
+        sections = args.get("sections") or []
+        if not sections:
+            return "Provide at least one section."
+
+        embed = discord.Embed(colour=discord.Colour(await self.bot._config.color()))
+        if args.get("title"):
+            embed.title = str(args["title"])[:256]
+        if args.get("intro"):
+            embed.description = str(args["intro"])[:4000]
+        if args.get("footer"):
+            embed.set_footer(text=str(args["footer"])[:2048])
+
+        mapping: dict = {}
+        for section in sections[:10]:
+            heading = str(section.get("heading") or "Roles").strip()[:256]
+            group = heading if section.get("exclusive") else None
+            lines = []
+            for item in (section.get("roles") or [])[:20]:
+                emoji = str(item.get("emoji") or "").strip()
+                role = self._resolve_role(guild, item.get("role", ""))
+                if not emoji or role is None or role.is_default():
+                    continue
+                if role.position >= guild.me.top_role.position:
+                    continue
+                lines.append(f"{emoji} — {role.name}")
+                mapping[emoji] = {"role_id": role.id, "group": group}
+            if lines:
+                embed.add_field(name=heading or "\u200b", value="\n".join(lines)[:1024], inline=False)
+
+        if not mapping:
+            return "I couldn't match any usable roles for the menu."
+
+        message = await target.send(embed=embed)
+        for emoji in mapping:
+            try:
+                await message.add_reaction(emoji)
+            except discord.HTTPException:
+                log.warning("Couldn't add reaction %s", _ascii(emoji))
+        async with self.config.guild(guild).react_roles() as data:
+            data[str(message.id)] = {"roles": mapping}
+        log.info("AI: %s posted a role menu (%d roles) in #%s", user, len(mapping), target.name)
+        return f"Posted a working reaction-role menu in #{target.name} (message id {message.id})."
+
+    async def _apply_reaction_role(self, payload, add: bool) -> None:
+        if payload.guild_id is None or payload.user_id == self.bot.user.id:
+            return
+        guild = self.bot.get_guild(payload.guild_id)
+        if guild is None:
+            return
+        data = await self.config.guild(guild).react_roles()
+        entry = data.get(str(payload.message_id))
+        if not entry:
+            return
+        mapping = (entry.get("roles") or {}).get(str(payload.emoji))
+        if not mapping:
+            return
+        member = guild.get_member(payload.user_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(payload.user_id)
+            except discord.HTTPException:
+                return
+        role = guild.get_role(mapping.get("role_id"))
+        if role is None:
+            return
+        if not guild.me.guild_permissions.manage_roles or role.position >= guild.me.top_role.position:
+            return
+        try:
+            if add:
+                group = mapping.get("group")
+                if group:
+                    for other_emoji, other in (entry.get("roles") or {}).items():
+                        if other.get("group") == group and other_emoji != str(payload.emoji):
+                            other_role = guild.get_role(other.get("role_id"))
+                            if other_role and other_role in member.roles:
+                                await member.remove_roles(other_role, reason="Reaction role (exclusive)")
+                if role not in member.roles:
+                    await member.add_roles(role, reason="Reaction role")
+            elif role in member.roles:
+                await member.remove_roles(role, reason="Reaction role")
+        except discord.HTTPException:
+            log.warning("Reaction role update failed in guild %s", guild.id)
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload):
+        try:
+            await self._apply_reaction_role(payload, True)
+        except Exception:  # noqa: BLE001
+            log.exception("Reaction-role add failed")
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_remove(self, payload):
+        try:
+            await self._apply_reaction_role(payload, False)
+        except Exception:  # noqa: BLE001
+            log.exception("Reaction-role remove failed")
 
     # ------------------------------------------------------------------ commands
 
