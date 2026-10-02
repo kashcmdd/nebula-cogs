@@ -107,8 +107,9 @@ READ_TOOLS = [
     _fn("list_webhooks", "List webhooks, optionally for one channel.", {"channel": _STR}),
     _fn("read_audit_log", "Read recent audit-log entries (who did what).",
         {"limit": {"type": "integer", "description": "1-50, default 20."}}),
-    _fn("read_messages", "Read recent messages in a channel (ids, authors, content).",
-        {"channel": _STR, "limit": {"type": "integer", "description": "1-50, default 20."}}),
+    _fn("read_messages", "Read recent messages, or one message by id. Includes embed titles, descriptions and fields.",
+        {"channel": _STR, "limit": {"type": "integer", "description": "1-50, default 20."},
+         "message_id": _STR_DESC("Read just this message instead of history.")}),
     _fn("list_scheduled_events", "List scheduled events."),
     _fn("list_automod_rules", "List AutoMod rules."),
 ]
@@ -336,6 +337,27 @@ class DeepSeek(commands.Cog):
             return await channel.fetch_message(int(message_id))
         except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError, TypeError):
             return None
+
+    @staticmethod
+    def _describe_message(message) -> str:
+        lines = [
+            f"- [{message.id}] {message.author}: "
+            f"{(message.content or '').replace(chr(10), ' ')[:200]}"
+        ]
+        for embed in message.embeds:
+            if embed.title:
+                lines.append(f"    embed title: {embed.title[:150]}")
+            if embed.description:
+                lines.append(f"    embed description: {embed.description.replace(chr(10), ' ')[:600]}")
+            for field in embed.fields:
+                lines.append(
+                    f"    embed field '{field.name}': {field.value.replace(chr(10), ' ')[:300]}"
+                )
+            if embed.footer and embed.footer.text:
+                lines.append(f"    embed footer: {embed.footer.text[:150]}")
+        for attachment in message.attachments:
+            lines.append(f"    attachment: {attachment.filename} ({attachment.url})")
+        return "\n".join(lines)
 
     @staticmethod
     def _parse_time(text):
@@ -1363,15 +1385,18 @@ class DeepSeek(commands.Cog):
         target = self._target_channel(guild, channel, args)
         if not isinstance(target, (discord.TextChannel, discord.Thread)):
             return "No matching text channel found."
+        if args.get("message_id"):
+            message = await self._fetch_message(target, args["message_id"])
+            if message is None:
+                return "I couldn't find that message."
+            return "Message:\n" + self._describe_message(message)
         limit = max(1, min(int(args.get("limit", 20)), 50))
         messages = [m async for m in target.history(limit=limit)]
         if not messages:
             return "No messages."
-        lines = []
-        for message in reversed(messages):
-            content = (message.content or "").replace("\n", " ")[:120]
-            lines.append(f"- [{message.id}] {message.author}: {content}")
-        return "Recent messages (oldest first):\n" + "\n".join(lines)
+        return "Recent messages (oldest first):\n" + "\n".join(
+            self._describe_message(message) for message in reversed(messages)
+        )
 
     async def _tool_edit_message(self, guild, channel, user, args) -> str:
         target = self._target_channel(guild, channel, args)
