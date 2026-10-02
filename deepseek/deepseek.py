@@ -54,14 +54,21 @@ class _AsciiSafeFilter(logging.Filter):
     before it reaches any handler prevents that entirely.
     """
 
+    @staticmethod
+    def _safe(value):
+        # Preserve numbers so %d / %f formatting still works; ASCII-ify the rest.
+        if value is None or isinstance(value, (int, float, bool)):
+            return value
+        return _ascii(value)
+
     def filter(self, record: logging.LogRecord) -> bool:
         if isinstance(record.msg, str):
             record.msg = _ascii(record.msg)
         if record.args:
             if isinstance(record.args, dict):
-                record.args = {key: _ascii(value) for key, value in record.args.items()}
+                record.args = {key: self._safe(value) for key, value in record.args.items()}
             else:
-                record.args = tuple(_ascii(arg) for arg in record.args)
+                record.args = tuple(self._safe(arg) for arg in record.args)
         return True
 
 
