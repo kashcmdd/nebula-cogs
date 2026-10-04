@@ -1,9 +1,19 @@
-# discord-bot-cogs
+# Nebula cogs
 
-Custom cogs for the Nebula deployment
-([Red-DiscordBot](https://github.com/Cog-Creators/Red-DiscordBot)).
+Original cogs for **Nebula**, a self-hosted Discord bot built on
+[Red-DiscordBot](https://github.com/Cog-Creators/Red-DiscordBot).
 
-These are original cogs — code written for this deployment, not bundled with Red.
+This is one of two repositories that make up the Nebula project:
+
+| Repository | Role |
+| --- | --- |
+| **[nebula](https://github.com/kashcmdd/nebula)** | Deployment layer: environment, config, scripts, docs. |
+| **nebula-cogs** (this repo) | The original cogs written for Nebula. |
+
+Local working copies are the folders `discord-bot-deploy` and `discord-bot-cogs`.
+They belong together: the deploy repo runs Red and loads these cogs.
+
+These are original cogs — code written for this project, not bundled with Red.
 
 ## Cogs
 
