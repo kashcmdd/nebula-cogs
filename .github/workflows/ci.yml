@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Byte-compile the cogs
+        run: python -m compileall -q .
+
+      - name: Validate info.json files
+        run: |
+          python - <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          failed = False
+          for path in sorted(pathlib.Path(".").rglob("info.json")):
+              try:
+                  json.loads(path.read_text(encoding="utf-8"))
+                  print(f"ok   {path}")
+              except Exception as exc:  # noqa: BLE001
+                  failed = True
+                  print(f"FAIL {path}: {exc}")
+          sys.exit(1 if failed else 0)
+          PY
