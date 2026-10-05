@@ -122,7 +122,7 @@ DEFAULT_SYSTEM = (
 )
 MAX_PROMPT_CHARS = 4000
 COOLDOWN_SECONDS = 3
-MAX_TOOL_ROUNDS = 8
+MAX_TOOL_ROUNDS = 40
 MAX_LIST_ITEMS = 60
 
 _PERM_FLAGS = getattr(discord.Permissions, "VALID_FLAGS", {})
@@ -379,7 +379,7 @@ class DeepSeek(commands.Cog):
     """A DeepSeek assistant that can read and manage the server."""
 
     __author__ = ["Riley"]
-    __version__ = "1.9.1"
+    __version__ = "1.9.2"
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -410,6 +410,7 @@ class DeepSeek(commands.Cog):
             vision=True,
             role_add_msg="Gave you **{role}**.",
             role_remove_msg="Removed **{role}**.",
+            max_rounds=MAX_TOOL_ROUNDS,
         )
         self.session: Optional[aiohttp.ClientSession] = None
         self.api_key: Optional[str] = None
@@ -771,7 +772,8 @@ class DeepSeek(commands.Cog):
 
         reply: Optional[str] = None
         tool_results: list[str] = []
-        for _ in range(MAX_TOOL_ROUNDS):
+        max_rounds = await conf.max_rounds()
+        for _ in range(max_rounds):
             try:
                 message = await self._request(guild, messages, tools)
             except MissingKey:
@@ -810,7 +812,15 @@ class DeepSeek(commands.Cog):
                 tool_results.append(result)
                 messages.append({"role": "tool", "tool_call_id": call.get("id"), "content": result})
         else:
-            reply = "I hit my tool-use limit for that request. Try smaller steps."
+            if tool_results:
+                done = "\n".join(f"- {result}" for result in tool_results[-15:])
+                reply = (
+                    f"I hit my step limit for a single request before finishing. "
+                    f"Done so far:\n{done}\n\n"
+                    'Say "continue" and I will pick up where I left off.'
+                )
+            else:
+                reply = "I hit my tool-use limit for that request. Try smaller steps."
 
         history.append({"role": "user", "content": prompt})
         history.append({"role": "assistant", "content": reply})
@@ -2524,6 +2534,12 @@ class DeepSeek(commands.Cog):
         await self.config.guild(ctx.guild).vision.set(enabled)
         await ctx.tick()
 
+    @aiset.command(name="maxrounds")
+    async def aiset_maxrounds(self, ctx: commands.Context, rounds: commands.Range[int, 4, 100]):
+        """Max tool steps the AI may take in one request (4-100, default 40)."""
+        await self.config.guild(ctx.guild).max_rounds.set(rounds)
+        await ctx.tick()
+
     @aiset.command(name="channel")
     async def aiset_channel(self, ctx: commands.Context, channel: discord.TextChannel = None):
         """Set an AI channel (no prefix needed), or omit the channel to clear it."""
@@ -2555,7 +2571,7 @@ class DeepSeek(commands.Cog):
         await ctx.send(
             f"Model: {settings['model']}\nHistory: {settings['max_history']} messages\n"
             f"Max tokens: {settings['max_tokens']}\nThinking: {settings['thinking']}\n"
-            f"Actions: {settings['allow_actions']}\nVision: {settings.get('vision', True)}\nAI channel: {channel}\n"
+            f"Actions: {settings['allow_actions']}\nVision: {settings.get('vision', True)}\nMax steps: {settings.get('max_rounds', 40)}\nAI channel: {channel}\n"
             f"Respond to mentions: {settings['respond_to_mentions']}\n"
             f"API key set: {'yes' if self.api_key else 'no'}"
         )
