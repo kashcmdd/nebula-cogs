@@ -117,7 +117,9 @@ class MemoryStore:
                 },
             },
             "embedder": {
-                "provider": "huggingface",
+                # fastembed runs on onnxruntime, so it avoids pulling Torch
+                # (which cost ~5 GB in this venv). Same 384-dim output.
+                "provider": "fastembed",
                 "config": {"model": embedder_model},
             },
             "vector_store": {
