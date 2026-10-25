@@ -57,7 +57,7 @@ Conversation context is kept per channel and user, in memory.
 ### Long-term memory
 
 Optional persistent layer (facts worth remembering across sessions), backed by
-[mem0](https://github.com/chaithon/mem0) with a local Qdrant vector store and a
+[mem0](https://github.com/mem0ai/mem0) with a local Qdrant vector store and a
 small local embedding model (BAAI/bge-small via fastembed).
 
 ```
@@ -67,9 +67,13 @@ pip install -r deepseek/requirements-memory.txt
 
 The cog degrades gracefully: without the packages installed, memory stays off and
 the bot behaves exactly as before. With them installed, `!aiset memory true` stores
-each exchange you have the bot store (after a successful `!ai`) and injects the
-most relevant memories into the system prompt on later asks. Toggle per server
-with `!aiset memory false`; inspect with `!aiset showsettings`.
+successful exchanges (from `!ai`, mentions, replies and AI-channel messages) and
+injects the most relevant memories into the system prompt on later asks. Toggle per
+server with `!aiset memory false`, choose how many facts are injected with
+`!aiset memorylimit <n>`, and inspect with `!aiset showsettings`.
+
+mem0 and fastembed require **Python 3.10+** (Red 3.5 itself supports 3.8.1+), so on
+an older interpreter leave memory disabled.
 
 Install order matters — `requirements-memory.txt` re-pins Red's exact
 `click`/`idna`/`typing-extensions` versions after mem0/fastembed upgrade them, so
@@ -101,7 +105,7 @@ to set by editing this cog's `DEFAULT_SYSTEM` and restarting).
 `read_audit_log`, `read_messages`, `list_scheduled_events`,
 `list_automod_rules`.
 
-**Act (53):**
+**Act (60):**
 - **Roles:** `add_role`, `remove_role`, `create_role`, `edit_role`,
   `delete_role`, `move_role`
 - **Channels:** `create_text_channel`, `create_voice_channel`,
@@ -122,6 +126,8 @@ to set by editing this cog's `DEFAULT_SYSTEM` and restarting).
 - **Scheduled events:** `create_scheduled_event`, `edit_scheduled_event`,
   `delete_scheduled_event`
 - **AutoMod:** `create_automod_rule`, `delete_automod_rule`
+- **Welcome & menus:** `set_welcome`, `disable_welcome`, `get_welcome`,
+  `test_welcome`, `send_sections`, `post_role_menu`, `set_role_messages`
 - **Server:** `edit_server`, `set_server_icon`, `set_server_banner`
 
 Every action is checked against the **requester's** Discord permission at
@@ -140,12 +146,15 @@ action that asks for confirmation first**. Disable all actions with
 | `!aiset maxtokens <n>` | Max tokens per reply (64-8192, default 800) |
 | `!aiset thinking <bool>` | Enable DeepSeek thinking mode (slower, smarter) |
 | `!aiset memory <bool>` | Enable long-term memory across sessions (needs mem0, see below) |
+| `!aiset memorylimit <n>` | Remembered facts injected per ask (1-20, default 5) |
 | `!aiset actions <bool>` | Allow role changes by the AI for users with permission |
+| `!aiset vision <bool>` | Read image attachments (deepseek-flash only) |
+| `!aiset maxrounds <n>` | Max tool steps per request (4-100, default 40) |
 | `!aiset channel <#chan>` | Set an AI channel (omit to clear) |
 | `!aiset mentions <bool>` | Reply when mentioned (default on) |
-| `!aiset clear` | Clear all context for the server |
+| `!aiset clear` | Clear in-memory context for the server |
 | `!aiset showsettings` | Show current settings |
-| `!aiclear` | Forget your context in this channel |
+| `!aiclear` | Forget your in-memory context in this channel |
 
 `aiset` requires Manage Server; `ai` is available to everyone (tune with Red's
 `!permissions` if needed).
