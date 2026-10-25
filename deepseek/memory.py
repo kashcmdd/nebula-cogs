@@ -23,6 +23,10 @@ import os
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
+# mem0 phones home to PostHog by default. Set before mem0 is imported, and
+# let an operator override it explicitly.
+os.environ.setdefault("MEM0_TELEMETRY", "False")
+
 log = logging.getLogger("red.nebula.deepseek.memory")
 
 # Where mem0's embedded Qdrant keeps its files. Overridable for tests.
@@ -33,6 +37,9 @@ DEFAULT_STORE_PATH = Path(
 
 # Local embedding model: small enough for CPU, good enough for retrieval.
 DEFAULT_EMBEDDER = "BAAI/bge-small-en-v1.5"
+# Must match the embedder above: bge-small outputs 384 dimensions, and mem0
+# creates the vector collection at this size on first use.
+DEFAULT_EMBEDDER_DIMS = 384
 
 # DeepSeek is OpenAI-compatible; mem0 needs *an* LLM configured even when we
 # never call it, because fact extraction is disabled (infer=False).
@@ -85,6 +92,7 @@ class MemoryStore:
         llm_model: str = DEFAULT_LLM_MODEL,
         base_url: str = DEFAULT_BASE_URL,
         store_path: Optional[Path] = None,
+        embedder_dims: int = DEFAULT_EMBEDDER_DIMS,
     ) -> None:
         if not api_key:
             raise MemoryUnavailable("no DeepSeek API key available for mem0")
@@ -114,7 +122,12 @@ class MemoryStore:
             },
             "vector_store": {
                 "provider": "qdrant",
-                "config": {"path": str(path)},
+                "config": {
+                    "path": str(path),
+                    # Without this mem0 builds the collection at its 1536
+                    # default and every 384-dim insert fails.
+                    "embedding_model_dims": embedder_dims,
+                },
             },
         }
 
@@ -141,7 +154,11 @@ class MemoryStore:
             return []
         try:
             result = await asyncio.to_thread(
-                self._memory.search, query, user_id=user_id, limit=limit
+                self._memory.search,
+                query,
+                # mem0 >=2.x rejects top-level user_id; scoping goes in filters.
+                filters={"user_id": user_id},
+                limit=limit,
             )
         except Exception:  # noqa: BLE001
             log.warning("mem0 search failed", exc_info=True)

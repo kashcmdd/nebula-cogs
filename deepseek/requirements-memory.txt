@@ -1,0 +1,16 @@
+# Optional dependencies for the DeepSeek cog's long-term memory layer.
+#
+#   pip install -r deepseek/requirements-memory.txt
+#
+# Only needed when you enable `!aiset memory true`. The cog works without
+# these; memory simply stays disabled.
+
+mem0ai>=2.2,<3
+sentence-transformers>=6,<7
+
+# mem0 installs pydantic 2.14+, which imports typing_extensions.Sentinel
+# (added in typing-extensions 4.14). Red-DiscordBot 3.5.x pins
+# typing-extensions==4.13.2, and the two cannot coexist: pydantic fails to
+# import and the bot will not start. Holding pydantic at 2.9.2 keeps both
+# working, and satisfies mem0's own pydantic>=2.7.3 requirement.
+pydantic==2.9.2
