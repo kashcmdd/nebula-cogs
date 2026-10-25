@@ -377,11 +377,20 @@ class ApiError(Exception):
         self.message = message
 
 
+class AnswerFailed(Exception):
+    """No usable answer was produced; ``str(exc)`` is safe to show the user.
+
+    Kept separate from unexpected exceptions so callers can tell a legitimate
+    error message (rate limit, missing key, network) from a real bug - and so
+    only real answers are written to long-term memory.
+    """
+
+
 class DeepSeek(commands.Cog):
     """A DeepSeek assistant that can read and manage the server."""
 
     __author__ = ["Riley"]
-    __version__ = "1.9.2"
+    __version__ = "1.10.0"
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -442,7 +451,13 @@ class DeepSeek(commands.Cog):
     @commands.Cog.listener()
     async def on_red_api_tokens_update(self, service_name: str, api_tokens: dict) -> None:
         if service_name == "deepseek":
-            self.api_key = api_tokens.get("api_key") or None
+            key = api_tokens.get("api_key") or None
+            if key != self.api_key:
+                self.api_key = key
+                # A store that was never built may retry with the new key; an
+                # existing one is left alone (LLM calls are disabled anyway).
+                if self._memory is None:
+                    self._memory_checked = False
 
     # ------------------------------------------------------------------ helpers
 
@@ -758,9 +773,10 @@ class DeepSeek(commands.Cog):
             return self._memory
         if self._memory_checked:
             return None
-        self._memory_checked = True
         if not self.api_key:
+            # Don't latch the failure: the key may be set later at runtime.
             return None
+        self._memory_checked = True
         try:
             self._memory = await asyncio.to_thread(MemoryStore, api_key=self.api_key)
         except MemoryUnavailable as exc:
@@ -832,21 +848,32 @@ class DeepSeek(commands.Cog):
             try:
                 message = await self._request(guild, messages, tools)
             except MissingKey:
-                return "I don't have a DeepSeek API key yet. An admin can set one with `!set api deepseek api_key <key>`."
+                raise AnswerFailed(
+                    "I don't have a DeepSeek API key yet. An admin can set one with "
+                    "`!set api deepseek api_key <key>`."
+                ) from None
             except ApiError as exc:
                 log.warning("DeepSeek API error %s: %s", exc.status, exc.message)
                 if exc.status == 401:
-                    return "My DeepSeek key was rejected (401). An admin should check it."
+                    raise AnswerFailed(
+                        "My DeepSeek key was rejected (401). An admin should check it."
+                    ) from None
                 if exc.status == 402:
-                    return "DeepSeek reports insufficient balance (402)."
+                    raise AnswerFailed("DeepSeek reports insufficient balance (402).") from None
                 if exc.status == 429:
-                    return "DeepSeek is rate-limiting me (429). Try again shortly."
+                    raise AnswerFailed(
+                        "DeepSeek is rate-limiting me (429). Try again shortly."
+                    ) from None
                 if exc.status == 400:
-                    return "DeepSeek rejected the request (400). Check the model name."
-                return f"DeepSeek returned an error ({exc.status})."
+                    raise AnswerFailed(
+                        "DeepSeek rejected the request (400). Check the model name."
+                    ) from None
+                raise AnswerFailed(f"DeepSeek returned an error ({exc.status}).") from None
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 log.warning("DeepSeek request failed", exc_info=True)
-                return "I couldn't reach DeepSeek just now. Try again in a moment."
+                raise AnswerFailed(
+                    "I couldn't reach DeepSeek just now. Try again in a moment."
+                ) from None
 
             tool_calls = message.get("tool_calls")
             if not tool_calls:
@@ -856,7 +883,7 @@ class DeepSeek(commands.Cog):
                 elif tool_results:
                     reply = "Done:\n" + "\n".join(f"- {result}" for result in tool_results[-6:])
                 else:
-                    reply = "I couldn't produce a reply."
+                    raise AnswerFailed("I couldn't produce a reply.")
                 break
 
             messages.append(
@@ -2516,25 +2543,27 @@ class DeepSeek(commands.Cog):
         attachments = [
             a for a in ctx.message.attachments if (a.content_type or "").startswith("image/")
         ]
-        remembered = True
+        remembered = False
         try:
             async with ctx.typing():
                 text = await self._answer(
                     ctx.guild, ctx.channel, ctx.author, prompt, image_attachments=attachments
                 )
+            remembered = True
+        except AnswerFailed as exc:
+            text = str(exc)
         except Exception:  # noqa: BLE001
             log.exception("DeepSeek command failed in guild %s", ctx.guild.id)
-            remembered = False
             text = "Something went wrong handling that request - check the bot logs."
-        # Never persist an error string as if it were something we learned.
+        await self._send(lambda content: ctx.reply(content, mention_author=False), text)
+        # Only successful answers are worth remembering; error strings are not.
         if remembered:
             await self._remember(ctx.guild, ctx.author, prompt, text)
-        await self._send(lambda content: ctx.reply(content, mention_author=False), text)
 
     @commands.command(name="aiclear")
     @commands.guild_only()
     async def aiclear(self, ctx: commands.Context):
-        """Forget our conversation in this channel."""
+        """Forget our in-memory conversation here (long-term memories are kept)."""
         self._history.pop((ctx.guild.id, ctx.channel.id, ctx.author.id), None)
         await ctx.tick()
 
@@ -2597,6 +2626,12 @@ class DeepSeek(commands.Cog):
             )
         await ctx.tick()
 
+    @aiset.command(name="memorylimit")
+    async def aiset_memorylimit(self, ctx: commands.Context, facts: commands.Range[int, 1, 20]):
+        """Set how many remembered facts are injected into each request (1-20)."""
+        await self.config.guild(ctx.guild).memory_limit.set(facts)
+        await ctx.tick()
+
     @aiset.command(name="actions")
     async def aiset_actions(self, ctx: commands.Context, enabled: bool):
         """Allow the AI to perform actions (with the requester's permissions)."""
@@ -2633,7 +2668,7 @@ class DeepSeek(commands.Cog):
 
     @aiset.command(name="clear")
     async def aiset_clear(self, ctx: commands.Context):
-        """Clear all stored conversation context for this server."""
+        """Clear the in-memory conversation context for this server."""
         for key in [k for k in self._history if k[0] == ctx.guild.id]:
             del self._history[key]
         await ctx.tick()
@@ -2710,6 +2745,7 @@ class DeepSeek(commands.Cog):
                     a for a in resolved.attachments if (a.content_type or "").startswith("image/")
                 ]
 
+        remembered = False
         try:
             async with message.channel.typing():
                 text = await self._answer(
@@ -2719,6 +2755,9 @@ class DeepSeek(commands.Cog):
                     prompt,
                     image_attachments=attachments,
                 )
+            remembered = True
+        except AnswerFailed as exc:
+            text = str(exc)
         except (discord.Forbidden, discord.HTTPException):
             return
         except Exception:  # noqa: BLE001 - never leave the user with no reply
@@ -2738,3 +2777,5 @@ class DeepSeek(commands.Cog):
             await self._send(send, text)
         except (discord.Forbidden, discord.HTTPException):
             return
+        if remembered:
+            await self._remember(message.guild, message.author, prompt, text)
