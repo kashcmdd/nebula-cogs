@@ -4,13 +4,23 @@
 #
 # Only needed when you enable `!aiset memory true`. The cog works without
 # these; memory simply stays disabled.
+#
+# Install order matters: mem0 and fastembed both bump Red's exact pins, so
+# this file re-pins them at the end. Verified against Red-DiscordBot 3.5.24
+# on Python 3.11.
 
 mem0ai>=2.2,<3
-sentence-transformers>=6,<7
+# ONNX embeddings instead of sentence-transformers/Torch: same 384-dim
+# bge-small output for ~130 MB instead of ~5 GB.
+fastembed>=0.9,<1
 
 # mem0 installs pydantic 2.14+, which imports typing_extensions.Sentinel
 # (added in typing-extensions 4.14). Red-DiscordBot 3.5.x pins
 # typing-extensions==4.13.2, and the two cannot coexist: pydantic fails to
-# import and the bot will not start. Holding pydantic at 2.9.2 keeps both
-# working, and satisfies mem0's own pydantic>=2.7.3 requirement.
+# import and the bot will not start. 2.9.2 satisfies mem0's pydantic>=2.7.3.
 pydantic==2.9.2
+
+# Red's exact pins, restored after mem0/fastembed upgrade them.
+click==8.1.8
+idna==3.11
+typing-extensions==4.13.2

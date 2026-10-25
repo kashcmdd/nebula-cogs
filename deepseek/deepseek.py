@@ -2505,7 +2505,7 @@ class DeepSeek(commands.Cog):
     @commands.command(name="ai", aliases=["ask"])
     @commands.guild_only()
     async def ai(self, ctx: commands.Context, *, prompt: str = None):
-        """Ask DeepSeek. Context is kept per channel and user."""
+        """Ask DeepSeek. Context is kept per channel and user, plus long-term memory."""
         if prompt is None:
             return await ctx.send_help()
         if not self._cooldown_ok(ctx.author.id):
@@ -2592,7 +2592,7 @@ class DeepSeek(commands.Cog):
         if store is None:
             return await ctx.send(
                 "Long-term memory is enabled, but mem0 could not initialise. "
-                "Install it with `pip install mem0ai sentence-transformers` and "
+                "Install it with `pip install -r deepseek/requirements-memory.txt` and "
                 "check the bot logs."
             )
         await ctx.tick()
@@ -2648,6 +2648,8 @@ class DeepSeek(commands.Cog):
             f"Max tokens: {settings['max_tokens']}\nThinking: {settings['thinking']}\n"
             f"Actions: {settings['allow_actions']}\nVision: {settings.get('vision', True)}\nMax steps: {settings.get('max_rounds', 40)}\nAI channel: {channel}\n"
             f"Respond to mentions: {settings['respond_to_mentions']}\n"
+            f"Memory: {'on' if settings.get('memory_enabled') else 'off'}\n"
+            f"Memory facts: {settings.get('memory_limit', 5)}\n"
             f"API key set: {'yes' if self.api_key else 'no'}"
         )
 

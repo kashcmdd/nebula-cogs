@@ -2,7 +2,8 @@ from .deepseek import DeepSeek
 
 __red_end_user_data_statement__ = (
     "Conversation context is kept in memory only and is not written to disk. "
-    "Prompts and responses are sent to the DeepSeek API for processing."
+    "Prompts and responses are sent to the DeepSeek API for processing. "
+    "If long-term memory is enabled, exchanges are also stored locally via mem0."
 )
 
 

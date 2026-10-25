@@ -5,13 +5,13 @@ process restarts and is capped by ``aiset history``. This module adds a second,
 persistent layer: facts worth remembering across sessions, retrieved by
 similarity instead of by recency.
 
-Everything here is optional. ``mem0`` and ``sentence-transformers`` are not
+Everything here is optional. ``mem0`` and ``fastembed`` are not
 dependencies of the cog, so ``import mem0`` happens lazily and a missing
 package simply disables the feature (see :class:`MemoryUnavailable`).
 
 To enable it:
 
-    pip install mem0ai sentence-transformers
+    pip install -r deepseek/requirements-memory.txt
     !aiset memory true
 """
 
@@ -101,7 +101,7 @@ class MemoryStore:
             from mem0 import Memory  # type: ignore[import-not-found]
         except Exception as exc:  # noqa: BLE001 - any import failure disables memory
             raise MemoryUnavailable(
-                "mem0 is not installed (pip install mem0ai sentence-transformers)"
+                "mem0 is not installed (pip install -r deepseek/requirements-memory.txt)"
             ) from exc
 
         path = Path(store_path or DEFAULT_STORE_PATH)

@@ -33,6 +33,9 @@ From Discord, as the bot owner:
 `!addpath` persists, and `!load` remembers the cog, so both survive restarts. The
 cog requires no extra Python packages (`aiohttp` ships with Red).
 
+Optional: long-term memory via mem0 — see [Long-term memory](#long-term-memory).
+Without it the cog still works, it just forgets everything between restarts.
+
 ## deepseek
 
 Two ways to talk to it, as intended:
@@ -50,6 +53,27 @@ Two ways to talk to it, as intended:
   no prefix or mention needed. Set with `!aiset channel #channel`.
 
 Conversation context is kept per channel and user, in memory.
+
+### Long-term memory
+
+Optional persistent layer (facts worth remembering across sessions), backed by
+[mem0](https://github.com/chaithon/mem0) with a local Qdrant vector store and a
+small local embedding model (BAAI/bge-small via fastembed).
+
+```
+pip install -r deepseek/requirements-memory.txt
+!aiset memory true
+```
+
+The cog degrades gracefully: without the packages installed, memory stays off and
+the bot behaves exactly as before. With them installed, `!aiset memory true` stores
+each exchange you have the bot store (after a successful `!ai`) and injects the
+most relevant memories into the system prompt on later asks. Toggle per server
+with `!aiset memory false`; inspect with `!aiset showsettings`.
+
+Install order matters — `requirements-memory.txt` re-pins Red's exact
+`click`/`idna`/`typing-extensions` versions after mem0/fastembed upgrade them, so
+the bot still starts on Red 3.5.x.
 
 ### API key
 
@@ -115,6 +139,7 @@ action that asks for confirmation first**. Disable all actions with
 | `!aiset history <n>` | Messages of context kept (0-100, default 10) |
 | `!aiset maxtokens <n>` | Max tokens per reply (64-8192, default 800) |
 | `!aiset thinking <bool>` | Enable DeepSeek thinking mode (slower, smarter) |
+| `!aiset memory <bool>` | Enable long-term memory across sessions (needs mem0, see below) |
 | `!aiset actions <bool>` | Allow role changes by the AI for users with permission |
 | `!aiset channel <#chan>` | Set an AI channel (omit to clear) |
 | `!aiset mentions <bool>` | Reply when mentioned (default on) |
