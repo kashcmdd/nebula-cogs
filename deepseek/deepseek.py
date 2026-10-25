@@ -36,6 +36,8 @@ from redbot.core import Config, commands
 from redbot.core.bot import Red
 from redbot.core.utils.chat_formatting import pagify
 
+from .memory import MemoryStore, MemoryUnavailable, format_memories
+
 log = logging.getLogger("red.cogs.deepseek")
 
 
@@ -411,12 +413,17 @@ class DeepSeek(commands.Cog):
             role_add_msg="Gave you **{role}**.",
             role_remove_msg="Removed **{role}**.",
             max_rounds=MAX_TOOL_ROUNDS,
+            memory_enabled=False,
+            memory_limit=5,
         )
         self.session: Optional[aiohttp.ClientSession] = None
         self.api_key: Optional[str] = None
         self._history: dict[tuple[int, int, int], list[dict[str, str]]] = {}
         self._last_used: dict[int, float] = {}
         self._last_warned: dict[int, float] = {}
+        # Long-term memory (mem0) is built on first use, and only once.
+        self._memory: Optional[MemoryStore] = None
+        self._memory_checked = False
 
     # ---------------------------------------------------------------- lifecycle
 
@@ -741,6 +748,41 @@ class DeepSeek(commands.Cog):
             urls.append(f"data:{attachment.content_type};base64,{encoded}")
         return urls
 
+    async def _memory_store(self) -> Optional[MemoryStore]:
+        """Build the mem0 store on first use; None when memory is unavailable.
+
+        Missing mem0, a failed embedding model download, or no API key all
+        degrade to the pre-existing per-channel history rather than erroring.
+        """
+        if self._memory is not None:
+            return self._memory
+        if self._memory_checked:
+            return None
+        self._memory_checked = True
+        if not self.api_key:
+            return None
+        try:
+            self._memory = await asyncio.to_thread(MemoryStore, api_key=self.api_key)
+        except MemoryUnavailable as exc:
+            log.info("Long-term memory disabled: %s", exc)
+            return None
+        except Exception:  # noqa: BLE001
+            log.warning("Long-term memory failed to initialise", exc_info=True)
+            return None
+        return self._memory
+
+    async def _remember(self, guild, user, prompt: str, reply: str) -> None:
+        """Persist one exchange, if the guild has long-term memory enabled."""
+        if not await self.config.guild(guild).memory_enabled():
+            return
+        store = await self._memory_store()
+        if store is None:
+            return
+        await store.add(
+            f"User: {prompt}\nAssistant: {reply}",
+            user_id=f"{guild.id}:{user.id}",
+        )
+
     async def _answer(
         self, guild, channel, user, prompt: str, image_attachments=None
     ) -> str:
@@ -749,10 +791,23 @@ class DeepSeek(commands.Cog):
         max_history = await conf.max_history()
         allow_actions = await conf.allow_actions()
 
+        memory_context = ""
+        if await conf.memory_enabled():
+            store = await self._memory_store()
+            if store is not None:
+                memories = await store.search(
+                    prompt,
+                    user_id=f"{guild.id}:{user.id}",
+                    limit=await conf.memory_limit(),
+                )
+                block = format_memories(memories)
+                if block:
+                    memory_context = f"\n\nThings you remember about this user:\n{block}"
+
         key = (guild.id, channel.id, user.id)
         history = self._history.setdefault(key, [])
         messages = [
-            {"role": "system", "content": f"{system}\n\n{self._requester_context(guild, channel, user)}"}
+            {"role": "system", "content": f"{system}{memory_context}\n\n{self._requester_context(guild, channel, user)}"}
         ]
         messages.extend(history[-max_history:])
 
@@ -2461,6 +2516,7 @@ class DeepSeek(commands.Cog):
         attachments = [
             a for a in ctx.message.attachments if (a.content_type or "").startswith("image/")
         ]
+        remembered = True
         try:
             async with ctx.typing():
                 text = await self._answer(
@@ -2468,7 +2524,11 @@ class DeepSeek(commands.Cog):
                 )
         except Exception:  # noqa: BLE001
             log.exception("DeepSeek command failed in guild %s", ctx.guild.id)
+            remembered = False
             text = "Something went wrong handling that request - check the bot logs."
+        # Never persist an error string as if it were something we learned.
+        if remembered:
+            await self._remember(ctx.guild, ctx.author, prompt, text)
         await self._send(lambda content: ctx.reply(content, mention_author=False), text)
 
     @commands.command(name="aiclear")
@@ -2520,6 +2580,21 @@ class DeepSeek(commands.Cog):
     async def aiset_thinking(self, ctx: commands.Context, enabled: bool):
         """Enable/disable DeepSeek thinking mode (slower, better at reasoning)."""
         await self.config.guild(ctx.guild).thinking.set(enabled)
+        await ctx.tick()
+
+    @aiset.command(name="memory")
+    async def aiset_memory(self, ctx: commands.Context, enabled: bool):
+        """Enable/disable long-term memory across sessions (needs mem0 installed)."""
+        await self.config.guild(ctx.guild).memory_enabled.set(enabled)
+        if not enabled:
+            return await ctx.tick()
+        store = await self._memory_store()
+        if store is None:
+            return await ctx.send(
+                "Long-term memory is enabled, but mem0 could not initialise. "
+                "Install it with `pip install mem0ai sentence-transformers` and "
+                "check the bot logs."
+            )
         await ctx.tick()
 
     @aiset.command(name="actions")
